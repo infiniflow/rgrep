@@ -1,0 +1,476 @@
+// Package infinity is rgrep's retrieval backend.
+//
+// Everything that is a search — the PLAID multi-vector recall and the BM25
+// full-text recall, and the fusion of the two — runs inside Infinity, through
+// the public Go SDK. rgrep sends one SELECT per query:
+//
+//	MATCH TENSOR (vec, <query token vectors>, 'float', 'maxsim', <n>)
+//	MATCH TEXT   (fts, '<query terms>', <n>)
+//	FUSION       ('weighted_sum' | 'rrf', <n>[, 'weights=…'])
+//
+// and only re-ranks what comes back (name boosts, test-path penalties, at most
+// two hits per file). It never scores vectors itself.
+//
+// The document table is deliberately plain: one row per code unit, a
+// MULTIVECTOR column for the ColBERT token vectors, a VARCHAR column for the
+// identifier-split text. Both get an index at open time, so the SQL above is
+// served by PLAID and by the inverted index respectively.
+package infinity
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/apache/thrift/lib/go/thrift"
+	sdk "github.com/infiniflow/infinity-go-sdk"
+
+	"github.com/infiniflow/rgrep/internal/store"
+)
+
+// Document table columns.
+const (
+	ColPath    = "path"
+	ColLang    = "lang"
+	ColKind    = "kind"
+	ColName    = "name"
+	ColParent  = "parent"
+	ColStart   = "start_line"
+	ColEnd     = "end_line"
+	ColText    = "text"
+	ColFTS     = "fts"
+	ColCode    = "code"
+	ColVectors = "vec"
+)
+
+// scoreColumn is what Infinity names a `score()` projection in the response.
+const scoreColumn = "SCORE"
+
+// Fusion methods the backend knows how to ask for.
+const (
+	FusionWeightedSum = "weighted_sum"
+	FusionRRF         = "rrf"
+)
+
+// Config is the connection and query shape of one Infinity instance.
+type Config struct {
+	Host     string
+	Port     int
+	Database string
+	Table    string
+
+	// Dim is the encoder width; the MULTIVECTOR column is (Dim).
+	Dim int
+	// TensorTopN / TextTopN are how many rows each branch contributes, and
+	// FusionTopN how many fused rows the engine keeps before rgrep re-ranks.
+	TensorTopN int
+	TextTopN   int
+	FusionTopN int
+	// Fusion is FusionWeightedSum (default) or FusionRRF.
+	Fusion string
+	// BatchSize is how many units go into one INSERT.
+	BatchSize int
+	// Timeout bounds both connect and each RPC.
+	Timeout time.Duration
+}
+
+func (c *Config) withDefaults() {
+	if c.Host == "" {
+		c.Host = "127.0.0.1"
+	}
+	if c.Port == 0 {
+		c.Port = 23817
+	}
+	if c.Database == "" {
+		c.Database = "rgrep"
+	}
+	if c.Table == "" {
+		c.Table = "code_units"
+	}
+	if c.Dim <= 0 {
+		c.Dim = 48
+	}
+	if c.TensorTopN <= 0 {
+		c.TensorTopN = 200
+	}
+	if c.TextTopN <= 0 {
+		c.TextTopN = 200
+	}
+	if c.FusionTopN <= 0 {
+		c.FusionTopN = 200
+	}
+	if c.Fusion == "" {
+		c.Fusion = FusionWeightedSum
+	}
+	if c.BatchSize <= 0 {
+		c.BatchSize = 64
+	}
+	if c.Timeout <= 0 {
+		c.Timeout = 10 * time.Second
+	}
+}
+
+// Addr is "host:port".
+func (c *Config) Addr() string { return fmt.Sprintf("%s:%d", c.Host, c.Port) }
+
+// Query is one hybrid retrieval request.
+type Query struct {
+	// Vectors is qn*Dim L2-normalised query token vectors.
+	Vectors [][]float32
+	// Text is the full-text side; empty means keyword recall is skipped.
+	Text string
+	// K is how many fused rows rgrep wants before its own re-ranking.
+	K     int
+	Alpha float64 // weight of the semantic branch for weighted_sum
+	// PathPrefix, Lang and Kind are pushed down as a filter.
+	PathPrefix string
+	Lang       string
+	Kind       string
+}
+
+// Hit is one row returned by the engine.
+type Hit struct {
+	Path      string
+	Lang      string
+	Kind      string
+	Name      string
+	Parent    string
+	StartLine int
+	EndLine   int
+	Score     float64
+	Code      string
+}
+
+// Backend is a connected Infinity instance holding the code-unit table.
+type Backend struct {
+	cfg  Config
+	conn *sdk.InfinityConnection
+	db   *sdk.Database
+	tbl  *sdk.Table
+}
+
+// Open connects, then makes sure the database, the table and both indexes
+// exist. Creating an index on an empty table is supported, so the table can be
+// prepared before the first `rgrep index` pass runs.
+func Open(cfg Config) (*Backend, error) {
+	cfg.withDefaults()
+	conn, err := sdk.NewInfinityConnectionWithConfig(
+		sdk.NetworkAddress{IP: cfg.Host, Port: cfg.Port},
+		&thrift.TConfiguration{ConnectTimeout: cfg.Timeout, SocketTimeout: cfg.Timeout},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("infinity %s is not reachable: %w", cfg.Addr(), err)
+	}
+	b := &Backend{cfg: cfg, conn: conn}
+	if err := b.ensureSchema(); err != nil {
+		_, _ = conn.Disconnect()
+		return nil, err
+	}
+	return b, nil
+}
+
+// Addr reports the endpoint, for `status`.
+func (b *Backend) Addr() string { return b.cfg.Addr() }
+
+// Table reports the fully qualified table name, for `status`.
+func (b *Backend) Table() string { return b.cfg.Database + "." + b.cfg.Table }
+
+func (b *Backend) ensureSchema() error {
+	db, err := b.conn.GetDatabase(b.cfg.Database)
+	if err != nil {
+		if db, err = b.conn.CreateDatabase(b.cfg.Database, sdk.ConflictTypeIgnore, ""); err != nil {
+			return fmt.Errorf("create database %s: %w", b.cfg.Database, err)
+		}
+	}
+	b.db = db
+
+	tbl, err := db.GetTable(b.cfg.Table)
+	if err != nil {
+		schema := sdk.TableSchema{
+			{Name: ColPath, DataType: "VARCHAR"},
+			{Name: ColLang, DataType: "VARCHAR"},
+			{Name: ColKind, DataType: "VARCHAR"},
+			{Name: ColName, DataType: "VARCHAR"},
+			{Name: ColParent, DataType: "VARCHAR"},
+			{Name: ColStart, DataType: "INTEGER"},
+			{Name: ColEnd, DataType: "INTEGER"},
+			{Name: ColText, DataType: "VARCHAR"},
+			{Name: ColFTS, DataType: "VARCHAR"},
+			{Name: ColCode, DataType: "VARCHAR"},
+			{Name: ColVectors, DataType: fmt.Sprintf("multivector,%d,float32", b.cfg.Dim)},
+		}
+		if tbl, err = db.CreateTable(b.cfg.Table, schema, sdk.ConflictTypeIgnore); err != nil {
+			return fmt.Errorf("create table %s: %w", b.cfg.Table, err)
+		}
+	}
+	b.tbl = tbl
+
+	// PLAID serves the multi-vector branch; the inverted index serves BM25.
+	// Both are idempotent: an existing index answers with the ignore conflict.
+	if _, err := tbl.CreateIndex("idx_"+ColVectors,
+		sdk.NewIndexInfo(ColVectors, sdk.IndexTypePLAID, nil), sdk.ConflictTypeIgnore, ""); err != nil {
+		return fmt.Errorf("create PLAID index on %s: %w", ColVectors, err)
+	}
+	if _, err := tbl.CreateIndex("idx_"+ColFTS,
+		sdk.NewIndexInfo(ColFTS, sdk.IndexTypeFullText, nil), sdk.ConflictTypeIgnore, ""); err != nil {
+		return fmt.Errorf("create fulltext index on %s: %w", ColFTS, err)
+	}
+	return nil
+}
+
+// ReplaceUnits makes the engine's rows for one file exactly `units`: it
+// deletes the file's rows and inserts the new ones. An empty `units` therefore
+// just drops the file.
+func (b *Backend) ReplaceUnits(path string, units []store.Unit) error {
+	if err := b.DeletePath(path); err != nil {
+		return err
+	}
+	if len(units) == 0 {
+		return nil
+	}
+	for start := 0; start < len(units); start += b.cfg.BatchSize {
+		end := start + b.cfg.BatchSize
+		if end > len(units) {
+			end = len(units)
+		}
+		rows := make([]map[string]interface{}, 0, end-start)
+		for i := start; i < end; i++ {
+			u := &units[i]
+			rows = append(rows, map[string]interface{}{
+				ColPath:    u.Path,
+				ColLang:    u.Lang,
+				ColKind:    u.Kind,
+				ColName:    u.Name,
+				ColParent:  u.Parent,
+				ColStart:   u.StartLine,
+				ColEnd:     u.EndLine,
+				ColText:    u.Text,
+				ColFTS:     u.FTS,
+				ColCode:    u.Code,
+				ColVectors: reshape(u.Vec, b.cfg.Dim),
+			})
+		}
+		if _, err := b.tbl.Insert(rows); err != nil {
+			return fmt.Errorf("insert %s units [%d:%d]: %w", path, start, end, err)
+		}
+	}
+	return nil
+}
+
+// DeletePath removes every row of one file.
+func (b *Backend) DeletePath(path string) error {
+	if _, err := b.tbl.Delete(fmt.Sprintf("%s = %s", ColPath, quote(path))); err != nil {
+		return fmt.Errorf("delete %s: %w", path, err)
+	}
+	return nil
+}
+
+// Search runs the hybrid query: PLAID recall, BM25 recall, and the fusion of
+// the two, all inside Infinity.
+func (b *Backend) Search(q Query) ([]Hit, error) {
+	hasText := strings.TrimSpace(q.Text) != ""
+	hasVec := len(q.Vectors) > 0
+	if !hasText && !hasVec {
+		return nil, nil
+	}
+	limit := q.K
+	if limit <= 0 {
+		limit = b.cfg.FusionTopN
+	}
+	if limit > b.cfg.FusionTopN {
+		limit = b.cfg.FusionTopN
+	}
+
+	var tbl *sdk.Table
+	switch {
+	case hasVec && hasText:
+		tbl = b.tbl.
+			MatchTensor(ColVectors, q.Vectors, "float", b.cfg.TensorTopN, nil).
+			MatchText(ColFTS, q.Text, b.cfg.TextTopN, nil).
+			Fusion(b.fusion(q), limit, b.fusionParams(q))
+	case hasVec:
+		tbl = b.tbl.MatchTensor(ColVectors, q.Vectors, "float", b.cfg.TensorTopN, nil)
+	default:
+		tbl = b.tbl.MatchText(ColFTS, q.Text, b.cfg.TextTopN, nil)
+	}
+	if filter := q.filter(); filter != "" {
+		tbl = tbl.Filter(filter)
+	}
+	res, err := tbl.
+		Output([]string{ColPath, ColLang, ColKind, ColName, ColParent, ColStart, ColEnd, ColCode, "score()"}).
+		Limit(limit).
+		ToResult()
+	if err != nil {
+		return nil, err
+	}
+	return hits(res)
+}
+
+// UnitAt returns the innermost unit of `path` that encloses `line`.
+func (b *Backend) UnitAt(path string, line int) (*store.Unit, error) {
+	filter := fmt.Sprintf("%s = %s AND %s <= %d AND %s >= %d",
+		ColPath, quote(path), ColStart, line, ColEnd, line)
+	res, err := b.tbl.
+		Filter(filter).
+		Output([]string{ColPath, ColLang, ColKind, ColName, ColParent, ColStart, ColEnd, ColText, ColCode}).
+		Sort([][2]interface{}{{ColStart, sdk.SortTypeAsc}}).
+		Limit(1).
+		ToResult()
+	if err != nil {
+		return nil, err
+	}
+	rows, ok := res.(*sdk.QueryResult)
+	if !ok {
+		return nil, fmt.Errorf("unexpected result type %T", res)
+	}
+	if n := len(rows.Data[ColPath]); n == 0 {
+		return nil, fmt.Errorf("%s:%d is not inside any indexed unit", path, line)
+	}
+	return &store.Unit{
+		Path:      str(rows.Data[ColPath][0]),
+		Lang:      str(rows.Data[ColLang][0]),
+		Kind:      str(rows.Data[ColKind][0]),
+		Name:      str(rows.Data[ColName][0]),
+		Parent:    str(rows.Data[ColParent][0]),
+		StartLine: num(rows.Data[ColStart][0]),
+		EndLine:   num(rows.Data[ColEnd][0]),
+		Text:      str(rows.Data[ColText][0]),
+		Code:      str(rows.Data[ColCode][0]),
+	}, nil
+}
+
+// Close disconnects.
+func (b *Backend) Close() error {
+	if b.conn == nil {
+		return nil
+	}
+	_, err := b.conn.Disconnect()
+	return err
+}
+
+func (b *Backend) fusion(q Query) string {
+	if b.cfg.Fusion == FusionRRF {
+		return FusionRRF
+	}
+	return FusionWeightedSum
+}
+
+func (b *Backend) fusionParams(q Query) map[string]interface{} {
+	if b.fusion(q) != FusionWeightedSum {
+		return nil
+	}
+	alpha := q.Alpha
+	if alpha <= 0 {
+		alpha = 0.6
+	}
+	if alpha > 1 {
+		alpha = 1
+	}
+	return map[string]interface{}{
+		"weights":   fmt.Sprintf("%.4f,%.4f", alpha, 1-alpha),
+		"normalize": "minmax",
+	}
+}
+
+// filter renders the pushed-down predicates. `no_tests` is not here: deciding
+// which path is a test needs rgrep's heuristics, so it stays client-side.
+func (q Query) filter() string {
+	var parts []string
+	if q.PathPrefix != "" {
+		lo := quote(q.PathPrefix)
+		// A byte-range filter instead of LIKE: the engine's expression parser
+		// rejects LIKE in a pushed-down filter (verified against rust_engine).
+		parts = append(parts, fmt.Sprintf("%s >= %s AND %s <= %s", ColPath, lo, ColPath, quote(q.PathPrefix+"\uffff")))
+	}
+	if q.Lang != "" {
+		parts = append(parts, fmt.Sprintf("%s = %s", ColLang, quote(q.Lang)))
+	}
+	if q.Kind != "" {
+		parts = append(parts, fmt.Sprintf("%s = %s", ColKind, quote(q.Kind)))
+	}
+	return strings.Join(parts, " AND ")
+}
+
+func hits(res interface{}) ([]Hit, error) {
+	rows, ok := res.(*sdk.QueryResult)
+	if !ok {
+		return nil, fmt.Errorf("unexpected result type %T", res)
+	}
+	n := len(rows.Data[ColPath])
+	out := make([]Hit, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, Hit{
+			Path:      str(rows.Data[ColPath][i]),
+			Lang:      str(rows.Data[ColLang][i]),
+			Kind:      str(rows.Data[ColKind][i]),
+			Name:      str(rows.Data[ColName][i]),
+			Parent:    str(rows.Data[ColParent][i]),
+			StartLine: num(rows.Data[ColStart][i]),
+			EndLine:   num(rows.Data[ColEnd][i]),
+			Code:      str(rows.Data[ColCode][i]),
+			Score:     numf(rows.Data[scoreColumn][i]),
+		})
+	}
+	return out, nil
+}
+
+// reshape turns the flat token buffer into the MULTIVECTOR literal the SDK
+// encodes for an insert: one row of `dim`-sized vectors.
+func reshape(vec []float32, dim int) [][]float32 {
+	if dim <= 0 || len(vec) == 0 {
+		return [][]float32{}
+	}
+	n := len(vec) / dim
+	out := make([][]float32, n)
+	for i := 0; i < n; i++ {
+		out[i] = vec[i*dim : (i+1)*dim]
+	}
+	return out
+}
+
+// quote renders a SQL string literal. Paths are the only untrusted input, and
+// a single quote is the only character that can end the literal early.
+func quote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+func str(v interface{}) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
+func num(v interface{}) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int32:
+		return int(n)
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	case float32:
+		return int(n)
+	}
+	return 0
+}
+
+func numf(v interface{}) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case float32:
+		return float64(n)
+	case int64:
+		return float64(n)
+	case int:
+		return float64(n)
+	case string:
+		f, _ := strconv.ParseFloat(n, 64)
+		return f
+	}
+	return 0
+}
