@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -12,26 +13,50 @@ import (
 	"github.com/infiniflow/rgrep/internal/store"
 )
 
-// The backend test needs a live Infinity server, so it is opt-in:
+// The backend test needs an engine. By default it starts an embedded one in a
+// temporary directory (which is also what rgrep does in production, so the test
+// exercises the same path); `RGREP_INFINITY_ADDR=host:port` points it at a
+// running server instead:
 //
 //	RGREP_INFINITY_ADDR=127.0.0.1:23817 go test ./internal/infinity
 func openTestBackend(t *testing.T) *Backend {
 	t.Helper()
-	addr := os.Getenv("RGREP_INFINITY_ADDR")
-	if addr == "" {
-		t.Skip("RGREP_INFINITY_ADDR is not set; skipping the Infinity backend test")
-	}
-	host, port := splitHostPort(addr)
 	dbName := fmt.Sprintf("rgrep_test_%d", time.Now().UnixNano())
-	b, err := Open(Config{
-		Host: host, Port: port, Database: dbName, Table: "code_units",
+	cfg := Config{
+		Database: dbName, Table: "code_units",
 		Dim: 4, BatchSize: 2, Timeout: 5 * time.Second,
-	})
+	}
+	if addr := os.Getenv("RGREP_INFINITY_ADDR"); addr != "" {
+		cfg.Host, cfg.Port = splitHostPort(addr)
+	} else {
+		dir := t.TempDir()
+		cfg.Embedded = true
+		cfg.DataDir = dir + "/infinity"
+		cfg.Socket = dir + "/infinity.sock"
+		cfg.LibDir = testLibDir()
+		if _, err := findLib(cfg.LibDir); err != nil {
+			t.Skipf("no embedded engine: %v (set RGREP_INFINITY_ADDR to use a server)", err)
+		}
+	}
+	b, err := Open(cfg)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
 	t.Cleanup(func() { _ = b.Close() })
 	return b
+}
+
+// testLibDir is where `make engine` puts the shared library, relative to this
+// package: `<repo>/bin/lib`.
+func testLibDir() string {
+	if dir := os.Getenv("RGREP_INFINITY_LIB_DIR"); dir != "" {
+		return dir
+	}
+	abs, err := filepath.Abs("../../bin/lib")
+	if err != nil {
+		return ""
+	}
+	return abs
 }
 
 func TestReplaceSearchAndDelete(t *testing.T) {

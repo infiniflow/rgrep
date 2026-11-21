@@ -60,6 +60,15 @@ type Config struct {
 	Database string
 	Table    string
 
+	// Embedded runs the engine inside this process (see `Embedded`): `DataDir`
+	// is where it keeps its segments, `Socket` the unix socket it serves and
+	// `LibDir` the directory holding the shared library. When Embedded is
+	// false, Host/Port name a server somebody else runs.
+	Embedded bool
+	DataDir  string
+	Socket   string
+	LibDir   string
+
 	// Dim is the encoder width; the MULTIVECTOR column is (Dim).
 	Dim int
 	// TensorTopN / TextTopN are how many rows each branch contributes, and
@@ -144,34 +153,73 @@ type Hit struct {
 
 // Backend is a connected Infinity instance holding the code-unit table.
 type Backend struct {
-	cfg  Config
-	conn *sdk.InfinityConnection
-	db   *sdk.Database
-	tbl  *sdk.Table
+	cfg      Config
+	conn     *sdk.InfinityConnection
+	db       *sdk.Database
+	tbl      *sdk.Table
+	embedded *Embedded
 }
 
 // Open connects, then makes sure the database, the table and both indexes
 // exist. Creating an index on an empty table is supported, so the table can be
 // prepared before the first `rgrep index` pass runs.
+//
+// In embedded mode it also *starts* the engine, which then lives exactly as
+// long as this Backend: nobody has to run `infinity serve`, and nothing
+// survives the process.
 func Open(cfg Config) (*Backend, error) {
 	cfg.withDefaults()
-	conn, err := sdk.NewInfinityConnectionWithConfig(
-		sdk.NetworkAddress{IP: cfg.Host, Port: cfg.Port},
-		&thrift.TConfiguration{ConnectTimeout: cfg.Timeout, SocketTimeout: cfg.Timeout},
+	conf := &thrift.TConfiguration{ConnectTimeout: cfg.Timeout, SocketTimeout: cfg.Timeout}
+	var (
+		conn     *sdk.InfinityConnection
+		embedded *Embedded
 	)
-	if err != nil {
-		return nil, fmt.Errorf("infinity %s is not reachable: %w", cfg.Addr(), err)
+	if cfg.Embedded {
+		e, err := StartEmbedded(cfg.LibDir, cfg.DataDir, cfg.Socket)
+		if err != nil {
+			return nil, err
+		}
+		embedded = e
+		conn, err = sdk.NewInfinityConnectionUnix(cfg.Socket, conf)
+		if err != nil {
+			_ = embedded.Stop()
+			return nil, fmt.Errorf("infinity (embedded) %s is not reachable: %w", cfg.Socket, err)
+		}
+	} else {
+		var err error
+		conn, err = sdk.NewInfinityConnectionWithConfig(
+			sdk.NetworkAddress{IP: cfg.Host, Port: cfg.Port}, conf)
+		if err != nil {
+			return nil, fmt.Errorf("infinity %s is not reachable: %w", cfg.Addr(), err)
+		}
 	}
-	b := &Backend{cfg: cfg, conn: conn}
+
+	b := &Backend{cfg: cfg, conn: conn, embedded: embedded}
 	if err := b.ensureSchema(); err != nil {
 		_, _ = conn.Disconnect()
+		_ = b.closeEngine()
 		return nil, err
 	}
 	return b, nil
 }
 
 // Addr reports the endpoint, for `status`.
-func (b *Backend) Addr() string { return b.cfg.Addr() }
+func (b *Backend) Addr() string {
+	if b.embedded != nil {
+		return "embedded:" + b.embedded.Socket()
+	}
+	return b.cfg.Addr()
+}
+
+// closeEngine stops an embedded engine, if this backend started one.
+func (b *Backend) closeEngine() error {
+	if b.embedded == nil {
+		return nil
+	}
+	e := b.embedded
+	b.embedded = nil
+	return e.Stop()
+}
 
 // Table reports the fully qualified table name, for `status`.
 func (b *Backend) Table() string { return b.cfg.Database + "." + b.cfg.Table }
@@ -342,10 +390,16 @@ func (b *Backend) UnitAt(path string, line int) (*store.Unit, error) {
 
 // Close disconnects.
 func (b *Backend) Close() error {
-	if b.conn == nil {
-		return nil
+	var err error
+	if b.conn != nil {
+		_, err = b.conn.Disconnect()
+		b.conn = nil
 	}
-	_, err := b.conn.Disconnect()
+	// The engine this backend started goes down with it: that is the whole
+	// point of the embedded mode, and it also releases the data dir.
+	if stopErr := b.closeEngine(); err == nil {
+		err = stopErr
+	}
 	return err
 }
 

@@ -11,6 +11,11 @@ kept for what a search engine cannot answer — the per-file fingerprint that
 makes indexing incremental. The two are not alternatives; they have different
 jobs. See [`docs/INFINITY_INTEGRATION.md`](docs/INFINITY_INTEGRATION.md).
 
+The engine is **embedded**: it is a shared library the daemon loads, it serves
+the ordinary thrift API on a unix socket in the data dir, and it stops when the
+daemon does. There is no server to install, no port to pick and nothing to
+supervise. `infinity_mode: "remote"` switches to a server somebody else runs.
+
 ## Architecture
 
 ```
@@ -21,24 +26,28 @@ jobs. See [`docs/INFINITY_INTEGRATION.md`](docs/INFINITY_INTEGRATION.md).
         │  rgrep CLI  │ ───────────────┐
         └─────────────┘                │
                                        ▼
-                              ┌──────────────────────────────┐
-                              │  rgrep serve (daemon)        │  the only writer
-                              │  ├ walk / hash / plan        │
-                              │  ├ native.Split   (Rust)     │  tree-sitter
-                              │  ├ native.Tokenize (Rust)    │  HF tokenizer
-                              │  ├ embed (ONNX int8)         │  LateOn-Code-edge
-                              │  └ internal/infinity         │  Go SDK → Infinity
-                              └──────────────────────────────┘
-                                       │                    │
-                        catalog (SQLite)│                    │units (MULTIVECTOR + FTS)
-                        files / meta    │                    ▼
-                                        ▼              ┌───────────┐
-                                  ~/…/rgrep.db         │ Infinity  │
-                                                       └───────────┘
+       ┌───────────────────────────────────────────────────┐
+       │  rgrep serve (daemon)                             │  the only writer
+       │  ├ walk / hash / plan                             │
+       │  ├ native.Split   (Rust)                          │  tree-sitter
+       │  ├ native.Tokenize (Rust)                         │  HF tokenizer
+       │  ├ embed (ONNX int8)                              │  LateOn-Code-edge
+       │  └ internal/infinity ──┐                          │
+       │                        │ unix socket, in-process  │
+       │     ┌──────────────────▼───────────────────────┐  │
+       │     │ Infinity (libinfinity_embedded)          │  │
+       │     │ PLAID + FULLTEXT + FUSION                │  │
+       │     └──────────────────┬───────────────────────┘  │
+       └────────────────────────┼──────────────────────────┘
+                                ▼
+                 $DATA_DIR/infinity/{catalog,data,wal}
+
+       catalog (SQLite): $DATA_DIR/rgrep.db — files / meta only
 ```
 
 Process model: the CLI starts the daemon on demand, and the daemon exits after
-30 minutes idle. `--in-process` skips the daemon entirely (CI, sandboxes).
+30 minutes idle. `--in-process` skips the daemon entirely (CI, sandboxes) and
+still gets its own embedded engine for the length of the command.
 
 The Rust static library (`native/rgrep_native`) exposes only a small C ABI:
 
@@ -54,20 +63,22 @@ directly: one cgo call returns the whole structured tree, and the rest is Go.
 ## Quick start
 
 ```bash
-# 1. Infinity has to be running; rgrep connects over Thrift (default :23817).
-infinity serve /var/infinity 0.0.0.0:23817
-
-# 2. Build rgrep.
-make native                 # Rust static library (needs cargo)
+# 1. Build. `make engine` compiles the embedded engine's shared library from
+#    the engine checkout next to this repo and copies it into bin/lib.
+make native                 # tree-sitter + tokenizer, Rust static library
+make engine                 # the database itself (needs ../infinity/rust_engine)
 RGREP_PROXY=socks5h://127.0.0.1:7891 make ort   # optional libonnxruntime
 make build                  # produces bin/rgrep
 
-# 3. Index and search.
+# 2. Index and search. Nothing else has to be running.
 bin/rgrep index ~/code/my-repo -y
 bin/rgrep search "how are retries configured" -k 5
 bin/rgrep search "parseConfig" -k 3 --json
 bin/rgrep get internal/config/config.go:37
 ```
+
+`bin/rgrep` finds the engine in `bin/lib`. Set `infinity_lib_dir` to point
+elsewhere, or `infinity_mode: "remote"` plus `infinity_addr` to use a server.
 
 The first run writes `~/Library/Application Support/rgrep/config.json`
 (`~/.config/rgrep` on Linux). `--home <dir>` puts it elsewhere.
@@ -132,7 +143,9 @@ One row per code unit in the Infinity table `rgrep.code_units`:
 | `vec` | `MULTIVECTOR(FLOAT,48)` of the ColBERT token vectors |
 
 Indexes: `USING PLAID` on `vec`, full-text on `fts`. Both are created at startup,
-before the table has any rows.
+before the table has any rows. The rows themselves live in
+`$DATA_DIR/infinity` (`catalog/`, `data/`, `wal/`), written by the embedded
+engine and readable only through it.
 
 The SQLite catalog (`$DATA_DIR/rgrep.db`) holds only `files` (hash, mtime, size,
 lang, unit count per file) and `meta`. It never holds text or vectors.
@@ -180,7 +193,11 @@ model every time.
   "model_dir": "/path/to/LateOn-Code-edge",  // contains model_int8.onnx + tokenizer.json
   "ort_lib_dir": "bin/onnxruntime/lib",      // libonnxruntime.*
 
-  "infinity_addr": "127.0.0.1:23817",        // Thrift endpoint
+  "infinity_mode": "embedded",               // or "remote"
+  "infinity_lib_dir": "",                    // default: <exe dir>/lib
+  // Remote mode only. The embedded engine ignores it: it serves a unix socket
+  // of its own under data_dir.
+  "infinity_addr": "127.0.0.1:23817",
   "infinity_db": "rgrep",
   "infinity_table": "code_units",
   "tensor_topn": 200,                        // rows from the PLAID branch
@@ -199,7 +216,9 @@ model every time.
 }
 ```
 
-`RGREP_INFINITY_ADDR` overrides the endpoint (useful for tests).
+`RGREP_INFINITY_ADDR` switches to remote mode against that endpoint (useful for
+tests); `RGREP_INFINITY_MODE` overrides the mode. The embedded engine keeps its
+segments in `$DATA_DIR/infinity` and serves `$DATA_DIR/infinity.sock`.
 
 `onnxruntime_go` is built against `ORT_API_VERSION 29`, so it **needs ORT
 1.29.x**; on a mismatch the process prints `The requested API version ... is not
@@ -208,8 +227,13 @@ encoder: the pipeline still runs, but the vectors carry no meaning.
 
 ## Known limits
 
-- **No local index**: if Infinity is unreachable, `index` and `search` fail
-  instead of silently degrading. The catalog is not a fallback search index.
+- **No fallback index**: if the engine cannot start (missing shared library) or
+  a remote server is unreachable, `index` and `search` fail instead of silently
+  degrading. The catalog is not a fallback search index.
+- **The embedded engine is one process**: `rgrep index` and `rgrep serve` each
+  open the data dir, so two of them cannot run at once (the second reports the
+  RocksDB lock). The daemon is the intended single writer; `--in-process` is for
+  one-shot runs while it is stopped.
 - **Filter expressions**: pushed-down filters cannot use `LIKE` (the engine's
   expression parser rejects it), so `--path` becomes a byte range
   `path >= p AND path <= p\uffff`. A path containing characters above U+FFFF
@@ -232,10 +256,12 @@ internal/daemon       unix-socket server + client + lifecycle (instance.lock, id
 internal/app          wires config + catalog + Infinity backend + encoder
 internal/index        walk / incremental plan / unit building / batch encoding
 internal/search       post-ranking on top of the engine's fused candidates
-internal/infinity     the Infinity backend (Go SDK), the only retrieval path
+internal/infinity     the Infinity backend (Go SDK) + the embedded engine's
+                      loader (dlopen, start/stop tied to the process)
 internal/store        the code-unit model + the SQLite catalog (files/meta)
 internal/embed        Embedder interface + ONNX + hash fallback
-internal/native       cgo bindings (the only Rust boundary)
+internal/native       cgo bindings to the splitter (Rust)
 native/rgrep_native   Rust: tree-sitter + tokenizers, JSON out
+bin/lib               libinfinity_embedded — the engine, loaded at runtime
 docs/                 integration notes
 ```

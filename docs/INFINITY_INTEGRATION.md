@@ -20,6 +20,46 @@ SQLite is therefore **not** a fallback search index. If Infinity is unreachable,
 `rgrep index` and `rgrep search` fail with the connection error. A silent
 fallback would hide a broken deployment and return worse results than an error.
 
+## Embedded mode (default)
+
+A local code search should not need a database server installed, a port picked,
+or a supervisor to keep the two processes in step. So the engine runs **inside
+the rgrep daemon**:
+
+```
+rgrep serve ── dlopen ──▶ libinfinity_embedded
+     │                        │
+     │  unix socket           ├─ Engine::open($DATA_DIR/infinity)
+     └──── $DATA_DIR/infinity.sock ── PLAID/FULLTEXT/FUSION
+```
+
+- `make engine` builds `libinfinity_embedded` from the engine checkout and
+  copies it to `bin/lib`; the daemon loads it with `dlopen` (`infinity_lib_dir`
+  points elsewhere if needed). No link-time dependency, and a missing library is
+  a clear error rather than a link failure.
+- `inf_embedded_start(data_dir, socket)` opens the engine and serves the
+  ordinary thrift front end on `$DATA_DIR/infinity.sock`. It returns once the
+  socket exists, so the first client never races the listener.
+- `inf_embedded_stop` signals the serving thread, joins it, unlinks the socket
+  and closes the engine, releasing the RocksDB lock on the data directory.
+  `App.Close` (daemon exit, `shutdown`, a one-shot `--in-process` run) calls it,
+  so the engine's lifetime is exactly the daemon's.
+- No TCP listener is opened: the daemon holds only `daemon.sock` (its own API)
+  and `infinity.sock` (the engine).
+
+Why a socket and not a function-call ABI: everything above the transport —
+thrift framing, the session table, every statement arm, the panic boundary —
+already exists in the engine's `server` crate, and a client that speaks thrift
+over a unix socket is the *same client* as one that speaks it over TCP. The only
+SDK change is a dialer (`infinity.UnixAddress`, `NewInfinityConnectionUnix`), so
+`Database`/`Table`/`MatchTensor`/`Fusion` behave identically in both modes. A
+`select`-level C ABI would have meant a second statement path to keep in step,
+and the SQL surface cannot express hybrid search anyway (`MATCH TENSOR`/`MATCH
+TEXT` exist only in the thrift `search_exprs`).
+
+`infinity_mode: "remote"` (or `RGREP_INFINITY_ADDR=host:port`) keeps the old
+behaviour: connect to a server somebody else runs.
+
 ## Interface rule
 
 rgrep uses the SDK's own vocabulary — `infinity.Connect`, `Database`,
@@ -27,7 +67,8 @@ rgrep uses the SDK's own vocabulary — `infinity.Connect`, `Database`,
 `Sort`, `ToResult` — and nothing rgrep-specific. When a capability is missing it
 is added to the SDK, not hidden behind a private ABI. That keeps two things
 true: anything rgrep can do, another client of the SDK can do; and an rgrep bug
-is reproducible with a few SDK calls.
+is reproducible with a few SDK calls. The embedded mode follows the same rule:
+it is a transport the SDK speaks, not a second API.
 
 ## Schema
 
@@ -153,7 +194,9 @@ candidates but cannot invent them.
 
 ```jsonc
 {
-  "infinity_addr": "127.0.0.1:23817",
+  "infinity_mode": "embedded",   // or "remote"
+  "infinity_lib_dir": "",        // default: <exe dir>/lib
+  "infinity_addr": "127.0.0.1:23817",   // remote mode only
   "infinity_db": "rgrep",
   "infinity_table": "code_units",
   "tensor_topn": 200,
@@ -163,20 +206,25 @@ candidates but cannot invent them.
 }
 ```
 
-`RGREP_INFINITY_ADDR` overrides the endpoint, which is how the integration test
-is pointed at a non-default port.
+Derived in embedded mode: `$DATA_DIR/infinity` (segments) and
+`$DATA_DIR/infinity.sock` (the engine's socket). `RGREP_INFINITY_ADDR` forces
+remote mode against that endpoint, which is how the integration test is pointed
+at a running server.
 
 ## Testing
 
-Unit tests never need a server. The backend test is opt-in:
+The backend test starts an **embedded** engine in a temporary directory, so it
+needs no server:
 
 ```bash
-RGREP_INFINITY_ADDR=127.0.0.1:23817 go test ./internal/infinity
+go test ./internal/infinity
 ```
 
 It creates a database named `rgrep_test_<unix-nano>`, writes two units, and
 checks semantic recall, hybrid recall, prefix filtering, unit lookup and
-delete-by-path. Without the environment variable the test skips.
+delete-by-path. It skips only when `bin/lib` has no engine library (`make
+engine`); `RGREP_INFINITY_ADDR=host:port` points it at a running server instead,
+and `RGREP_INFINITY_LIB_DIR` at another library location.
 
 ## Verified engine behaviours
 
@@ -196,3 +244,7 @@ the C++ implementation:
 | `Filter` with `LIKE` | rejected by the expression parser |
 | `Delete(filter)` | works |
 | `Sort` + `Limit` on a filtered read | works |
+| thrift over a unix socket (embedded engine) | works: same SDK calls, `UnixAddress` dialer |
+| engine inside the host process, no TCP listener | verified with `lsof`: only unix sockets |
+| stop removes the socket, data reopens | verified: restart keeps the rows, no stale lock |
+| a VARCHAR cell containing a TAB | fixed in the engine; the stored row text escapes it |

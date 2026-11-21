@@ -24,10 +24,19 @@ type Config struct {
 	// ORTLibDir contains libonnxruntime.*.dylib / .so / .dll.
 	ORTLibDir string `json:"ort_lib_dir"`
 
-	// InfinityAddr is the Thrift endpoint of the Infinity server that holds
-	// the code units: PLAID multi-vector recall, BM25 full-text recall and the
-	// fusion of the two all run there.
+	// InfinityMode is "embedded" (default) or "remote". Embedded runs the
+	// engine inside the daemon, on a unix socket in the data dir, so there is
+	// no server to install, no port to pick and nothing to supervise: the
+	// engine's lifetime is the daemon's. Remote connects to a server someone
+	// else runs, over TCP.
+	InfinityMode string `json:"infinity_mode"`
+	// InfinityAddr is the Thrift endpoint used in remote mode. PLAID
+	// multi-vector recall, BM25 full-text recall and the fusion of the two all
+	// run in the engine either way.
 	InfinityAddr string `json:"infinity_addr"`
+	// InfinityLibDir holds the embedded engine's shared library
+	// (libinfinity_embedded.dylib / .so). Empty resolves to `<exe dir>/lib`.
+	InfinityLibDir string `json:"infinity_lib_dir"`
 	// InfinityDB / InfinityTable name the unit table inside Infinity.
 	InfinityDB    string `json:"infinity_db"`
 	InfinityTable string `json:"infinity_table"`
@@ -68,6 +77,12 @@ type Config struct {
 	// InfinityHost/InfinityPort are InfinityAddr split apart.
 	InfinityHost string `json:"-"`
 	InfinityPort int    `json:"-"`
+
+	// Derived from InfinityMode: where the embedded engine keeps its files,
+	// the socket it serves, and whether it is embedded at all.
+	InfinityEmbedded bool   `json:"-"`
+	InfinityDataDir  string `json:"-"`
+	InfinitySocket   string `json:"-"`
 }
 
 // Duration is a time.Duration that marshals as a string ("30m").
@@ -103,6 +118,7 @@ func DefaultDataDir() string {
 func defaults() *Config {
 	cfg := &Config{
 		DataDir:       DefaultDataDir(),
+		InfinityMode:  "embedded",
 		InfinityAddr:  "127.0.0.1:23817",
 		InfinityDB:    "rgrep",
 		InfinityTable: "code_units",
@@ -154,16 +170,30 @@ func Load(dataDirOverride string) (*Config, error) {
 	if v := os.Getenv("RGREP_MODEL_DIR"); v != "" {
 		cfg.ModelDir = v
 	}
+	if v := os.Getenv("RGREP_INFINITY_MODE"); v != "" {
+		cfg.InfinityMode = v
+	}
 	if v := os.Getenv("RGREP_INFINITY_ADDR"); v != "" {
 		cfg.InfinityAddr = v
+		// An explicit endpoint means "talk to that server", which is how the
+		// tests and a shared deployment run rgrep.
+		cfg.InfinityMode = "remote"
 	}
 	cfg.InfinityHost, cfg.InfinityPort = splitAddr(cfg.InfinityAddr)
+	cfg.InfinityEmbedded = !strings.EqualFold(strings.TrimSpace(cfg.InfinityMode), "remote")
+	cfg.InfinityDataDir = filepath.Join(cfg.DataDir, "infinity")
+	cfg.InfinitySocket = socketPathNamed(cfg.DataDir, "infinity.sock", "rgrep-infinity-%d.sock")
 	if cfg.ModelDir == "" {
 		cfg.ModelDir = filepath.Join(cfg.DataDir, "models", "LateOn-Code-edge")
 	}
 	if cfg.ORTLibDir == "" {
 		if exe, err := os.Executable(); err == nil {
 			cfg.ORTLibDir = filepath.Join(filepath.Dir(exe), "onnxruntime", "lib")
+		}
+	}
+	if cfg.InfinityLibDir == "" {
+		if exe, err := os.Executable(); err == nil {
+			cfg.InfinityLibDir = filepath.Join(filepath.Dir(exe), "lib")
 		}
 	}
 
@@ -201,11 +231,17 @@ func splitAddr(addr string) (string, int) {
 
 // socketPath keeps the UDS path short (macOS caps it at 104 bytes).
 func socketPath(dataDir string) string {
-	short := filepath.Join(os.TempDir(), fmt.Sprintf("rgrep-%d.sock", os.Getuid()))
-	if sum := len(filepath.Join(dataDir, "daemon.sock")); sum <= 96 && runtime.GOOS != "windows" {
-		return filepath.Join(dataDir, "daemon.sock")
+	return socketPathNamed(dataDir, "daemon.sock", "rgrep-%d.sock")
+}
+
+// socketPathNamed is [`socketPath`] for a socket with its own name, falling
+// back to the temp dir when the data dir path would be too long.
+func socketPathNamed(dataDir, name, fallbackFmt string) string {
+	p := filepath.Join(dataDir, name)
+	if len(p) <= 96 && runtime.GOOS != "windows" {
+		return p
 	}
-	return short
+	return filepath.Join(os.TempDir(), fmt.Sprintf(fallbackFmt, os.Getuid()))
 }
 
 // EnsureDirs creates the data directory layout and writes a default config on
