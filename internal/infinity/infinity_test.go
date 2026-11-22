@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	sdk "github.com/infiniflow/infinity-go-sdk"
+
 	"github.com/infiniflow/rgrep/internal/store"
 )
 
@@ -123,6 +125,23 @@ func TestReplaceSearchAndDelete(t *testing.T) {
 		t.Fatalf("prefix filter hits = %+v", hits)
 	}
 
+	// The equality filters are answered from the secondary indexes, which the
+	// engine intersects while it builds the recall's candidate mask.
+	hits, err = b.Search(Query{Vectors: [][]float32{{1, 0, 0, 0}}, K: 5, Lang: "go", Kind: "function"})
+	if err != nil {
+		t.Fatalf("indexed filter search: %v", err)
+	}
+	if len(hits) != 2 {
+		t.Fatalf("indexed filter hits = %+v", hits)
+	}
+	hits, err = b.Search(Query{Vectors: [][]float32{{1, 0, 0, 0}}, K: 5, Lang: "rust"})
+	if err != nil {
+		t.Fatalf("indexed filter search: %v", err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("lang=rust matched %+v", hits)
+	}
+
 	// Unit lookup picks the enclosing unit.
 	u, err := b.UnitAt("pkg/quantize.go", 15)
 	if err != nil {
@@ -162,6 +181,37 @@ func TestReshapeAndQuote(t *testing.T) {
 	}
 	if (Query{}).filter() != "" {
 		t.Fatal("empty query must not emit a filter")
+	}
+}
+
+// The filter is answered by secondary indexes, so every filtered column needs
+// one, and the two that hold a handful of values need the bitmap layout.
+func TestIndexSpecsAnswerTheFilter(t *testing.T) {
+	secondary := map[string]*sdk.IndexInfo{}
+	for _, ix := range indexSpecs(1024) {
+		if ix.info.IndexType == sdk.IndexTypeSecondary {
+			secondary[ix.info.TargetName] = ix.info
+		}
+		if ix.info.IndexType == sdk.IndexTypePLAID {
+			// The centroid budget has to reach the engine: with the engine's own
+			// choice a full pass retrains tens of thousands of centroids.
+			if got := ix.info.Params["n_centroids"]; got != "1024" {
+				t.Fatalf("plaid n_centroids = %q, want 1024", got)
+			}
+		}
+	}
+	for _, column := range []string{ColPath, ColLang, ColKind} {
+		if secondary[column] == nil {
+			t.Fatalf("%s carries no secondary index: %+v", column, secondary)
+		}
+	}
+	for _, column := range []string{ColLang, ColKind} {
+		if got := secondary[column].Params["cardinality"]; got != "low" {
+			t.Fatalf("%s cardinality = %q, want low", column, got)
+		}
+	}
+	if got := secondary[ColPath].Params["cardinality"]; got != "" {
+		t.Fatalf("path cardinality = %q: a path is unique per file", got)
 	}
 }
 

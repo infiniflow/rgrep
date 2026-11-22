@@ -90,6 +90,9 @@ CREATE TABLE code_units (
 );
 CREATE INDEX idx_vec ON code_units (vec) USING PLAID;
 CREATE INDEX idx_fts ON code_units (fts) USING FULLTEXT;
+CREATE INDEX idx_path ON code_units (path) USING SECONDARY;
+CREATE INDEX idx_lang ON code_units (lang) USING SECONDARY WITH (cardinality='low');
+CREATE INDEX idx_kind ON code_units (kind) USING SECONDARY WITH (cardinality='low');
 ```
 
 The SDK spells the multi-vector type `"multivector,48,float32"` (comma form, not
@@ -97,9 +100,16 @@ the SQL `MULTIVECTOR(FLOAT,48)` form). Insert values are `[][]float32` — one
 slice of 48 floats per token vector, which the SDK encodes as a `DoubleTensor`
 literal.
 
-Both indexes are created at startup, before any row exists. PLAID training then
-happens on insert. This was verified explicitly, because "create index on an
-empty table" is the kind of thing that works in one engine and not another.
+The vector and full-text indexes are created at startup, before any row exists.
+PLAID training then happens on insert. This was verified explicitly, because
+"create index on an empty table" is the kind of thing that works in one engine
+and not another.
+
+The secondary indexes exist for the filter and for the writes. The engine answers
+a filter from them while it builds the recall's candidate mask, so `--lang`
+narrows before any row is read; `path = ?` is a point probe, which is what keeps
+`DELETE ... WHERE path = ?` (every re-indexed file) and `rgrep get` off a full
+scan.
 
 ## Write path
 
@@ -163,6 +173,12 @@ Details that matter and were verified:
   answers "the filter must be a boolean expression"). `--path` is therefore a
   byte range, `path >= 'internal/' AND path <= 'internal/\uffff'`; `lang` and
   `kind` are plain equalities, joined with `AND`.
+- **`lang` and `kind` are answered by their secondary indexes; the `--path`
+  prefix is not.** A VARCHAR secondary key is a hash (`ConvertToHashU64`), so the
+  index answers `col = ?` and nothing ordered: the two equalities become bitmap
+  reads the engine intersects into the recall's candidate mask, while the
+  prefix range is evaluated per row against the candidates. Only an equality on
+  a full path (`rgrep get`, the per-file delete) is a probe.
 - **`--no-tests` stays in Go.** "Is this path a test" is rgrep's heuristic
   (`_test.go`, `/tests/`, `.spec.`, …), not something the engine should know.
 - **The table object is reusable.** `ToResult` resets the query builder, so one
@@ -241,6 +257,9 @@ the C++ implementation:
 | `FUSION('weighted_sum', 'weights=0.6,0.4')` | works; `score()` returns the fused value |
 | `score()` in the projection | returned as column `SCORE` |
 | `Filter` with `=`, `!=`, `>=`, `<`, `AND`, `OR` | works |
+| `SECONDARY ... WITH (cardinality='low')` on a VARCHAR column | works: `lang = ?` is answered from that value's bitmap |
+| `Filter` with two equalities on indexed columns | both indexes answer; the engine intersects them into the recall's mask |
+| `Filter` with a range on a VARCHAR index | not index-answered (the key is a hash); evaluated per candidate |
 | `Filter` with `LIKE` | rejected by the expression parser |
 | `Delete(filter)` | works |
 | `Sort` + `Limit` on a filtered read | works |
@@ -248,3 +267,47 @@ the C++ implementation:
 | engine inside the host process, no TCP listener | verified with `lsof`: only unix sockets |
 | stop removes the socket, data reopens | verified: restart keeps the rows, no stale lock |
 | a VARCHAR cell containing a TAB | fixed in the engine; the stored row text escapes it |
+
+## Sizing, measured on ragflow
+
+`~/codebase/workspace/rag/ragflow` — 5 227 indexable files, 91 MB of
+`.go`/`.py`/`.ts`/`.tsx`/`.js`, 61 934 units. Timings from this machine, one
+pass, embedded engine.
+
+| configuration | per unit | full pass | index after the pass |
+|---|---|---|---|
+| `doc_len 256`, `max_embed_chars 8000`, engine-chosen centroids | 46.4 KB | did not finish (see below) | — |
+| `doc_len 128`, `max_embed_chars 1600`, engine-chosen centroids | 33.5 KB | — | — |
+| `doc_len 128`, `max_embed_chars 1600`, `plaid_centroids 1024` | 48 KB | **17 m 27 s**, 0 failed | 2.98 GB, 4.4 GB once PLAID has built |
+
+`doc_len` and `max_embed_chars` were measured on `internal/agent` (355 files,
+5 772 units): 2 m 43 s / 269 MB before, 1 m 32 s / 194 MB after, with the same
+top hits on the queries that were compared. `max_embed_chars` only has to cover
+`doc_len` tokens — the encoder truncates the token list anyway, so 8000
+characters spent most of every tokenizer pass on tokens that were thrown away.
+
+`plaid_centroids` is not an optimisation, it is the difference between
+finishing and not. The engine sizes the coarse centroids as `16*sqrt(tokens)`
+when the index does not name a number, which for 61 934 units (~8 M token
+vectors) is tens of thousands, and `kmeans_l2` costs
+`min(tokens, 256*n_centroids) * n_centroids * dims` per iteration. With the
+engine's own choice a pass stalled at 48 000 units inside
+`PlaidIndex::train`/`assign_rows` for more than ten minutes at 830 % CPU and
+4.3 GB RSS; with 1024 it never stalls.
+
+Two costs remain, both engine-side and both visible on this corpus:
+
+- **PLAID used to be rebuilt by the first query after a pass**, over every row:
+  on the 62 k unit table it exceeded the 120 s RPC timeout, the query failed, and
+  the daemon kept a client whose reply was still queued (`Select: out of order
+  sequence response` for every later call). The engine now publishes the mirror
+  from the **checkpoint** (chunks cover the rows the checkpoint wrote, and a
+  load appends the unreached tail and writes it back), and `Backend.read`
+  reconnects and retries once. What is left is the load: 19-23 s of a cold
+  `--in-process` start on 5.7 k units, spent decoding the tensor column while
+  the index is opened (a warm daemon answers in 0.46 s). In daemon mode it is
+  paid once per process, not per query.
+- **The vector column is stored twice** — once in the row blocks, once in the
+  PLAID chunks — and it is ~90 % of the index. 48 KB per unit is
+  `min(tokens, 126) * 48 * 4` bytes twice; quantising to int8 or keeping only
+  the index copy would cut it four to eight times.

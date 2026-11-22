@@ -57,11 +57,27 @@ type Config struct {
 	PrefixQ  int32 `json:"prefix_q"`
 	PrefixD  int32 `json:"prefix_d"`
 
+	// PlaidCentroids is the PLAID coarse-centroid budget, and the single
+	// parameter that decides how long a full index pass takes. The engine sizes
+	// it as `16*sqrt(token vectors)` by default - 32 768 for a 130 k-unit repo -
+	// and its k-means costs `min(tokens, 256*k) * k * dims` per iteration, so the
+	// default turns indexing into hours of training before the first query can
+	// be answered (measured: a full ragflow pass stalled 8+ minutes inside
+	// `PlaidIndex::train` at 48 k units, at 4.3 GB RSS). 1024 keeps a full build
+	// in seconds; 0 restores the engine's own choice.
+	PlaidCentroids int `json:"plaid_centroids"`
+
 	// BatchSize is the ONNX batch size used while indexing.
 	BatchSize int `json:"batch_size"`
 	// MaxFileBytes skips huge files (generated code, vendored blobs).
 	MaxFileBytes int64 `json:"max_file_bytes"`
 	// MaxEmbedChars truncates the structured text before tokenization.
+	//
+	// It has to cover `DocLen` tokens and no more: the encoder cuts the token
+	// list to `DocLen-2` whatever arrives, so a budget of 8000 characters spent
+	// ~87% of every tokenizer pass on tokens that were then thrown away. Code
+	// runs about three characters per token, so 1600 characters is ~500 tokens -
+	// comfortably over a 126-token document.
 	MaxEmbedChars int `json:"max_embed_chars"`
 	// IdleTimeout is how long the daemon lingers without work.
 	IdleTimeout Duration `json:"idle_timeout"`
@@ -127,17 +143,28 @@ func defaults() *Config {
 		FusionTopN:    200,
 		Fusion:        "weighted_sum",
 		Dim:           48,
-		DocLen:        512,
-		QueryLen:      256,
-		ClsID:         50281,
-		SepID:         50282,
-		PrefixQ:       50368,
-		PrefixD:       50369,
-		BatchSize:     8,
-		MaxFileBytes:  1 << 20,
-		MaxEmbedChars: 8000,
-		IdleTimeout:   Duration(30 * time.Minute),
-		Ignore:        []string{},
+		// DocLen is the per-unit token cap of the late-interaction encoding: a
+		// unit costs `min(tokens, DocLen-2) * Dim * 4` bytes **twice** - once in
+		// the row's MULTIVECTOR column, once in the PLAID chunk - so its price is
+		// the dominant term in the index size. Measured on ragflow's
+		// `internal/agent` (355 files, 5 772 units): 512 gave ~185 KB per unit,
+		// 256 gave 46.6 KB, 128 gives 32 KB and encodes the same file in 1.9x
+		// less time, with the same results on the queries that were compared.
+		// 256 therefore costs ~2x the disk and ~2x the time of 128, and only
+		// pays off for prose-heavy corpora whose meaning sits past the first
+		// ~500 characters. Raise it there, not by default.
+		DocLen:         128,
+		QueryLen:       256,
+		ClsID:          50281,
+		SepID:          50282,
+		PrefixQ:        50368,
+		PrefixD:        50369,
+		PlaidCentroids: 1024,
+		BatchSize:      8,
+		MaxFileBytes:   1 << 20,
+		MaxEmbedChars:  1600,
+		IdleTimeout:    Duration(30 * time.Minute),
+		Ignore:         []string{},
 	}
 	// A local development fallback: the workspace checkout of the model.
 	if home, err := os.UserHomeDir(); err == nil {

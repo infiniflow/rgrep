@@ -15,12 +15,21 @@
 // MULTIVECTOR column for the ColBERT token vectors, a VARCHAR column for the
 // identifier-split text. Both get an index at open time, so the SQL above is
 // served by PLAID and by the inverted index respectively.
+//
+// The filter is answered from secondary indexes, not by re-reading rows: `lang`
+// and `kind` are low-cardinality secondary indexes, so the engine turns
+// `lang = 'go' AND kind = 'function'` into two bitmap reads and intersects them
+// while building the candidate mask of the recall. `path` carries one too, which
+// answers `path = ?` (the delete of a file being re-indexed, and `rgrep get`).
+// A path *prefix* cannot use it - a VARCHAR secondary key is a hash, so it has
+// no order to scan - and stays a residual predicate.
 package infinity
 
 import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/apache/thrift/lib/go/thrift"
@@ -80,6 +89,11 @@ type Config struct {
 	Fusion string
 	// BatchSize is how many units go into one INSERT.
 	BatchSize int
+	// PlaidCentroids is the coarse-centroid budget of the PLAID index: 0 lets
+	// the engine size it from the token count, which on a large repo asks for
+	// tens of thousands of centroids and turns one index pass into hours of
+	// k-means. See `indexSpecs`.
+	PlaidCentroids int
 	// Timeout bounds both connect and each RPC.
 	Timeout time.Duration
 }
@@ -116,7 +130,14 @@ func (c *Config) withDefaults() {
 		c.BatchSize = 64
 	}
 	if c.Timeout <= 0 {
-		c.Timeout = 10 * time.Second
+		// Not a query deadline: a write's own RPC can carry the engine's
+		// checkpoint. The engine seals its append buffer at 512 MB, which is
+		// about 9 k units, and the checkpoint that follows writes the block
+		// mirror before it answers - seconds of work inside the insert that
+		// crossed the line. At the old 10 s the first such insert came back as
+		// "i/o timeout" and aborted a full index run at exactly that size
+		// (measured, twice, at 9336 units).
+		c.Timeout = 120 * time.Second
 	}
 }
 
@@ -158,6 +179,12 @@ type Backend struct {
 	db       *sdk.Database
 	tbl      *sdk.Table
 	embedded *Embedded
+	// mu serialises engine calls. The SDK client is one thrift connection with
+	// one request/response stream, so two goroutines sharing it interleave their
+	// frames; the daemon serves one goroutine per client, which is how a query
+	// issued while an index pass was running came back as a socket timeout and
+	// then poisoned the connection for every later call.
+	mu sync.Mutex
 }
 
 // Open connects, then makes sure the database, the table and both indexes
@@ -201,6 +228,62 @@ func Open(cfg Config) (*Backend, error) {
 		return nil, err
 	}
 	return b, nil
+}
+
+// reconnect drops the client and dials a new one. The engine's thrift client is
+// one connection with one request/response stream: an RPC that hit the socket
+// timeout leaves its reply queued, so the next call reads the previous call's
+// frame (`Select: out of order sequence response`) or blocks again, and the
+// daemon then fails every query until it is restarted. Rebuilding the client is
+// the only way back.
+func (b *Backend) reconnect() error {
+	if b.conn != nil {
+		_, _ = b.conn.Disconnect()
+		b.conn = nil
+	}
+	conf := &thrift.TConfiguration{ConnectTimeout: b.cfg.Timeout, SocketTimeout: b.cfg.Timeout}
+	var (
+		conn *sdk.InfinityConnection
+		err  error
+	)
+	if b.cfg.Embedded {
+		conn, err = sdk.NewInfinityConnectionUnix(b.cfg.Socket, conf)
+	} else {
+		conn, err = sdk.NewInfinityConnectionWithConfig(
+			sdk.NetworkAddress{IP: b.cfg.Host, Port: b.cfg.Port}, conf)
+	}
+	if err != nil {
+		return fmt.Errorf("reconnect %s: %w", b.Addr(), err)
+	}
+	db, err := conn.GetDatabase(b.cfg.Database)
+	if err != nil {
+		_, _ = conn.Disconnect()
+		return fmt.Errorf("reconnect %s: %w", b.Addr(), err)
+	}
+	tbl, err := db.GetTable(b.cfg.Table)
+	if err != nil {
+		_, _ = conn.Disconnect()
+		return fmt.Errorf("reconnect %s: %w", b.Addr(), err)
+	}
+	b.conn, b.db, b.tbl = conn, db, tbl
+	return nil
+}
+
+// read runs one engine read, and retries it once on a fresh connection if the
+// first attempt failed. Reads are idempotent, so the retry cannot duplicate
+// anything; writes are not wrapped, and rely on the indexer's own recovery
+// (`ReplaceUnits` deletes the file's rows before it writes them).
+func (b *Backend) read(fn func() error) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	err := fn()
+	if err == nil {
+		return nil
+	}
+	if rerr := b.reconnect(); rerr != nil {
+		return err
+	}
+	return fn()
 }
 
 // Addr reports the endpoint, for `status`.
@@ -254,24 +337,77 @@ func (b *Backend) ensureSchema() error {
 	}
 	b.tbl = tbl
 
-	// PLAID serves the multi-vector branch; the inverted index serves BM25.
-	// Both are idempotent: an existing index answers with the ignore conflict.
-	if _, err := tbl.CreateIndex("idx_"+ColVectors,
-		sdk.NewIndexInfo(ColVectors, sdk.IndexTypePLAID, nil), sdk.ConflictTypeIgnore, ""); err != nil {
-		return fmt.Errorf("create PLAID index on %s: %w", ColVectors, err)
-	}
-	if _, err := tbl.CreateIndex("idx_"+ColFTS,
-		sdk.NewIndexInfo(ColFTS, sdk.IndexTypeFullText, nil), sdk.ConflictTypeIgnore, ""); err != nil {
-		return fmt.Errorf("create fulltext index on %s: %w", ColFTS, err)
+	for _, ix := range indexSpecs(b.cfg.PlaidCentroids) {
+		// Ask first. `CREATE INDEX ... IF NOT EXISTS` is supposed to be the
+		// one call that does that, but this engine's `IF NOT EXISTS` still
+		// rewrites the catalog record and rebuilds the index over every row
+		// (measured: 260 s per open on 4.6 k units), which made every command
+		// after the first one time out. A `SHOW INDEX` is a catalog read.
+		if _, err := tbl.ShowIndex(ix.name); err == nil {
+			continue
+		}
+		if _, err := tbl.CreateIndex(ix.name, ix.info, sdk.ConflictTypeIgnore, ""); err != nil {
+			return fmt.Errorf("create %s index on %s: %w", ix.what, ix.info.TargetName, err)
+		}
 	}
 	return nil
+}
+
+// indexSpec is one index the schema needs.
+type indexSpec struct {
+	name string
+	what string
+	info *sdk.IndexInfo
+}
+
+// indexSpecs is everything the unit table needs beyond its columns.
+//
+// The three secondary indexes are the filter's own path through the engine:
+//
+//   - `idx_path` answers `path = ?`. `ReplaceUnits` deletes a file's rows before
+//     it writes the new ones, and that delete without an index is a scan of the
+//     whole table - the cost that made a full index run quadratic (313 files in
+//     807 s, ending when one delete passed the RPC timeout). The same index makes
+//     `UnitAt` (`rgrep get`) a probe plus a line comparison instead of a scan.
+//   - `idx_lang` and `idx_kind` answer the search filter. Both hold a handful of
+//     distinct values, so they are `cardinality = 'low'`: one roaring bitmap per
+//     value, which the engine intersects while building the recall's candidate
+//     mask, instead of decoding those columns of every row.
+func indexSpecs(plaidCentroids int) []indexSpec {
+	secondary := func(column string, low bool) *sdk.IndexInfo {
+		var params map[string]string
+		if low {
+			params = map[string]string{"cardinality": "low"}
+		}
+		return sdk.NewIndexInfo(column, sdk.IndexTypeSecondary, params)
+	}
+	// `n_centroids` is the one PLAID parameter that decides how long an index
+	// pass takes: the engine's own choice is `16*sqrt(tokens)` rounded down to a
+	// power of two, so a repo of 130 k units (~16 M token vectors) asks for 32 768
+	// centroids, and `kmeans_l2` over `min(tokens, 256*k)` samples costs
+	// `samples * k * dims` per iteration. That is hours, spent before a single
+	// query can be answered. A fixed budget keeps the build in seconds; 0 leaves
+	// the engine's heuristic in place.
+	var plaid map[string]string
+	if plaidCentroids > 0 {
+		plaid = map[string]string{"n_centroids": strconv.Itoa(plaidCentroids)}
+	}
+	return []indexSpec{
+		{"idx_" + ColVectors, "PLAID", sdk.NewIndexInfo(ColVectors, sdk.IndexTypePLAID, plaid)},
+		{"idx_" + ColFTS, "full-text", sdk.NewIndexInfo(ColFTS, sdk.IndexTypeFullText, nil)},
+		{"idx_" + ColPath, "path", secondary(ColPath, false)},
+		{"idx_" + ColLang, "lang", secondary(ColLang, true)},
+		{"idx_" + ColKind, "kind", secondary(ColKind, true)},
+	}
 }
 
 // ReplaceUnits makes the engine's rows for one file exactly `units`: it
 // deletes the file's rows and inserts the new ones. An empty `units` therefore
 // just drops the file.
 func (b *Backend) ReplaceUnits(path string, units []store.Unit) error {
-	if err := b.DeletePath(path); err != nil {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err := b.deletePath(path); err != nil {
 		return err
 	}
 	if len(units) == 0 {
@@ -308,6 +444,13 @@ func (b *Backend) ReplaceUnits(path string, units []store.Unit) error {
 
 // DeletePath removes every row of one file.
 func (b *Backend) DeletePath(path string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.deletePath(path)
+}
+
+// deletePath is the lock-free form, for callers that already hold `mu`.
+func (b *Backend) deletePath(path string) error {
 	if _, err := b.tbl.Delete(fmt.Sprintf("%s = %s", ColPath, quote(path))); err != nil {
 		return fmt.Errorf("delete %s: %w", path, err)
 	}
@@ -330,26 +473,33 @@ func (b *Backend) Search(q Query) ([]Hit, error) {
 		limit = b.cfg.FusionTopN
 	}
 
-	var tbl *sdk.Table
-	switch {
-	case hasVec && hasText:
-		tbl = b.tbl.
-			MatchTensor(ColVectors, q.Vectors, "float", b.cfg.TensorTopN, nil).
-			MatchText(ColFTS, q.Text, b.cfg.TextTopN, nil).
-			Fusion(b.fusion(q), limit, b.fusionParams(q))
-	case hasVec:
-		tbl = b.tbl.MatchTensor(ColVectors, q.Vectors, "float", b.cfg.TensorTopN, nil)
-	default:
-		tbl = b.tbl.MatchText(ColFTS, q.Text, b.cfg.TextTopN, nil)
+	var (
+		res interface{}
+		err error
+	)
+	run := func() error {
+		var tbl *sdk.Table
+		switch {
+		case hasVec && hasText:
+			tbl = b.tbl.
+				MatchTensor(ColVectors, q.Vectors, "float", b.cfg.TensorTopN, nil).
+				MatchText(ColFTS, q.Text, b.cfg.TextTopN, nil).
+				Fusion(b.fusion(q), limit, b.fusionParams(q))
+		case hasVec:
+			tbl = b.tbl.MatchTensor(ColVectors, q.Vectors, "float", b.cfg.TensorTopN, nil)
+		default:
+			tbl = b.tbl.MatchText(ColFTS, q.Text, b.cfg.TextTopN, nil)
+		}
+		if filter := q.filter(); filter != "" {
+			tbl = tbl.Filter(filter)
+		}
+		res, err = tbl.
+			Output([]string{ColPath, ColLang, ColKind, ColName, ColParent, ColStart, ColEnd, ColCode, "score()"}).
+			Limit(limit).
+			ToResult()
+		return err
 	}
-	if filter := q.filter(); filter != "" {
-		tbl = tbl.Filter(filter)
-	}
-	res, err := tbl.
-		Output([]string{ColPath, ColLang, ColKind, ColName, ColParent, ColStart, ColEnd, ColCode, "score()"}).
-		Limit(limit).
-		ToResult()
-	if err != nil {
+	if err = b.read(run); err != nil {
 		return nil, err
 	}
 	return hits(res)
@@ -359,13 +509,19 @@ func (b *Backend) Search(q Query) ([]Hit, error) {
 func (b *Backend) UnitAt(path string, line int) (*store.Unit, error) {
 	filter := fmt.Sprintf("%s = %s AND %s <= %d AND %s >= %d",
 		ColPath, quote(path), ColStart, line, ColEnd, line)
-	res, err := b.tbl.
-		Filter(filter).
-		Output([]string{ColPath, ColLang, ColKind, ColName, ColParent, ColStart, ColEnd, ColText, ColCode}).
-		Sort([][2]interface{}{{ColStart, sdk.SortTypeAsc}}).
-		Limit(1).
-		ToResult()
-	if err != nil {
+	var (
+		res interface{}
+		err error
+	)
+	if err = b.read(func() error {
+		res, err = b.tbl.
+			Filter(filter).
+			Output([]string{ColPath, ColLang, ColKind, ColName, ColParent, ColStart, ColEnd, ColText, ColCode}).
+			Sort([][2]interface{}{{ColStart, sdk.SortTypeAsc}}).
+			Limit(1).
+			ToResult()
+		return err
+	}); err != nil {
 		return nil, err
 	}
 	rows, ok := res.(*sdk.QueryResult)
@@ -429,6 +585,13 @@ func (b *Backend) fusionParams(q Query) map[string]interface{} {
 
 // filter renders the pushed-down predicates. `no_tests` is not here: deciding
 // which path is a test needs rgrep's heuristics, so it stays client-side.
+//
+// The equalities are the ones the engine can answer from `idx_lang`/`idx_kind`:
+// each is a bitmap read, and a conjunction of them is intersected before the
+// recall starts, so a selective `--lang` no longer costs a decode of that column
+// of every row. The prefix is a residual predicate - a VARCHAR secondary key is
+// a hash (`ConvertToHashU64`), so no index can order it and a range over it is
+// evaluated row by row.
 func (q Query) filter() string {
 	var parts []string
 	if q.PathPrefix != "" {

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/infiniflow/rgrep/internal/embed"
 	"github.com/infiniflow/rgrep/internal/native"
@@ -29,6 +30,8 @@ type Options struct {
 	Force bool
 	// OnProgress is called between files; may be nil.
 	OnProgress func(done, total int, path string)
+	// OnError is called for a file that could not be indexed; may be nil.
+	OnError func(path string, err error)
 }
 
 // Stats summarises a pass.
@@ -100,7 +103,7 @@ func (ix *Indexer) Run(opt Options) (*Stats, error) {
 		opt.MaxFileBytes = 1 << 20
 	}
 	if opt.MaxEmbedChars <= 0 {
-		opt.MaxEmbedChars = 8000
+		opt.MaxEmbedChars = 1600
 	}
 	root, err := filepath.Abs(opt.Root)
 	if err != nil {
@@ -257,8 +260,18 @@ func (ix *Indexer) Run(opt Options) (*Stats, error) {
 		// Documents first, catalog second: a crash in between re-indexes the
 		// file next time (ReplaceUnits deletes by path first, so it is
 		// idempotent), while the other order would forget the units.
+		//
+		// One file the engine refuses does not end the pass: the row is counted
+		// in `failed` (which the caller prints) and the file stays out of the
+		// catalog, so the next run retries it. Aborting instead made a single
+		// payload the engine dislikes - a locale file here - discard a run that
+		// had already written 58 k units over half an hour.
 		if err := ix.eng.ReplaceUnits(c.rel, units); err != nil {
-			return nil, fmt.Errorf("write %s to infinity: %w", c.rel, err)
+			if opt.OnError != nil {
+				opt.OnError(c.rel, err)
+			}
+			stats.Failed++
+			continue
 		}
 		if err := ix.cat.PutFile(c.rel, store.FileState{
 			Hash: c.hash, MtimeNs: c.mtimeNs, Size: c.size, Lang: c.lang, Units: len(units),
@@ -377,11 +390,7 @@ func buildEmbedText(rel, lang string, u native.Unit, code string, maxChars int) 
 	}
 	b.WriteString("\nCode:\n")
 	b.WriteString(code)
-	s := b.String()
-	if len(s) > maxChars {
-		s = s[:maxChars]
-	}
-	return s
+	return truncate(b.String(), maxChars)
 }
 
 // buildFTSText pre-splits identifiers so `parse_arguments` and `parseArguments`
@@ -447,11 +456,22 @@ func SplitIdents(s string) string {
 	return strings.TrimSpace(out.String())
 }
 
+// truncate cuts s to at most max bytes without splitting a rune.
+//
+// The cut has to respect runes because the text is a VARCHAR the engine
+// validates as UTF-8: a byte cut through a multi-byte character made every
+// non-ASCII unit insert fail with `invalid argument: thrift: bad data`
+// (measured: 8 of the 8 `web/src/locales/*.ts` files in ragflow, all of them
+// CJK/Arabic/Cyrillic, while the ASCII files went through).
 func truncate(s string, max int) string {
 	if len(s) <= max {
 		return s
 	}
-	return s[:max]
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
 // embedUnits fills in Mean and Vec for every unit.

@@ -20,6 +20,10 @@ engine:
 	mkdir -p bin/lib
 	cp $(ENGINE)/target/release/libinfinity_embedded.dylib bin/lib/ 2>/dev/null || true
 	cp $(ENGINE)/target/release/libinfinity_embedded.so bin/lib/ 2>/dev/null || true
+	# Ad-hoc signing the copy, not the build output: a freshly linked 40 MB
+	# dylib can carry a page the kernel refuses ("SIGKILL (Code Signature
+	# Invalid)" inside dlopen), and the host dies before it prints anything.
+	codesign --force --sign - bin/lib/libinfinity_embedded.dylib 2>/dev/null || true
 
 $(BIN): native
 	mkdir -p bin

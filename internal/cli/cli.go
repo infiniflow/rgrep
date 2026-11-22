@@ -309,6 +309,9 @@ func cmdIndex(cfg *config.Config, args []string, isInit bool) int {
 					fmt.Fprintf(os.Stderr, "  [%d/%d] %s\n", done, total, path)
 				}
 			},
+			OnError: func(path string, err error) {
+				fmt.Fprintf(os.Stderr, "  skipped %s: %v\n", path, err)
+			},
 		})
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)

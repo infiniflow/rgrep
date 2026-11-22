@@ -37,19 +37,20 @@ func Open(cfg *config.Config) (*App, error) {
 	a := &App{Cfg: cfg, Cat: cat, Emb: emb, Note: note}
 
 	eng, err := infinity.Open(infinity.Config{
-		Host:       cfg.InfinityHost,
-		Port:       cfg.InfinityPort,
-		Database:   cfg.InfinityDB,
-		Table:      cfg.InfinityTable,
-		Embedded:   cfg.InfinityEmbedded,
-		DataDir:    cfg.InfinityDataDir,
-		Socket:     cfg.InfinitySocket,
-		LibDir:     cfg.InfinityLibDir,
-		Dim:        emb.Dim(),
-		TensorTopN: cfg.TensorTopN,
-		TextTopN:   cfg.TextTopN,
-		FusionTopN: cfg.FusionTopN,
-		Fusion:     cfg.Fusion,
+		Host:           cfg.InfinityHost,
+		Port:           cfg.InfinityPort,
+		Database:       cfg.InfinityDB,
+		Table:          cfg.InfinityTable,
+		Embedded:       cfg.InfinityEmbedded,
+		DataDir:        cfg.InfinityDataDir,
+		Socket:         cfg.InfinitySocket,
+		LibDir:         cfg.InfinityLibDir,
+		Dim:            emb.Dim(),
+		PlaidCentroids: cfg.PlaidCentroids,
+		TensorTopN:     cfg.TensorTopN,
+		TextTopN:       cfg.TextTopN,
+		FusionTopN:     cfg.FusionTopN,
+		Fusion:         cfg.Fusion,
 	})
 	if err != nil {
 		_ = emb.Close()

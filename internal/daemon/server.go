@@ -194,6 +194,12 @@ func (s *Server) dispatch(req *Request) Response {
 		stats, err := s.app.Indexer().Run(index.Options{
 			Root: p.Path, Ignore: s.cfg.Ignore, MaxFileBytes: s.cfg.MaxFileBytes,
 			MaxEmbedChars: s.cfg.MaxEmbedChars, Force: p.Force,
+			// The daemon has no stderr of its own beyond its log, so a file the
+			// engine refused is recorded there; the count reaches the client in
+			// the stats.
+			OnError: func(path string, err error) {
+				log.Printf("index: skipped %s: %v", path, err)
+			},
 		})
 		return wrap(stats, err)
 
