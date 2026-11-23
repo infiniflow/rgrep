@@ -30,6 +30,8 @@ type Options struct {
 	NoTests    bool
 	// Candidates is how many fused rows are fetched before re-ranking.
 	Candidates int
+	// Engine carries the recall operator's knobs through to the engine.
+	Engine map[string]string
 }
 
 // Result is one ranked code unit.
@@ -92,6 +94,7 @@ func (s *Searcher) Search(query string, opt Options) ([]Result, error) {
 		PathPrefix: opt.PathPrefix,
 		Lang:       opt.Lang,
 		Kind:       opt.Kind,
+		Options:    opt.Engine,
 	}
 	// The encoder decides the query shape: per-token vectors go to the PLAID
 	// branch, one pooled vector goes to the HNSW branch.

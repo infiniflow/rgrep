@@ -74,6 +74,8 @@ func main() {
 	k := flag.Int("k", 10, "cut-off for recall@k")
 	alpha := flag.Float64("alpha", 0.6, "semantic weight of the engine-side fusion")
 	only := flag.String("set", "", "evaluate only this query set (nl or symbol)")
+	dump := flag.Int("dump", 0, "print the top results of the first N queries")
+	engineOpts := flag.String("opts", "", "k=v,k=v knobs for the recall operator")
 	flag.Parse()
 
 	if *home == "" || *queriesPath == "" {
@@ -103,15 +105,35 @@ func main() {
 		os.Exit(1)
 	}
 
+	extra := map[string]string{}
+	for _, kv := range strings.Split(*engineOpts, ",") {
+		if kv = strings.TrimSpace(kv); kv == "" {
+			continue
+		}
+		key, val, _ := strings.Cut(kv, "=")
+		extra[key] = val
+	}
 	searcher := a.Searcher()
 	bySet := map[string]*stats{}
+	seen := 0
 	for _, q := range queries {
 		started := time.Now()
-		results, err := searcher.Search(q.Query, search.Options{K: *k, Alpha: *alpha})
+		results, err := searcher.Search(q.Query, search.Options{K: *k, Alpha: *alpha, Engine: extra})
 		elapsed := time.Since(started)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "query %q: %v\n", q.Query, err)
 			continue
+		}
+		if seen < *dump {
+			seen++
+			fmt.Printf("QUERY[%s] %q  want %s :: %s\n", q.Set, q.Query, q.Path, q.Name)
+			for i, result := range results {
+				mark := " "
+				if result.Path == q.Path && result.Name == q.Name {
+					mark = ">"
+				}
+				fmt.Printf("  %s%d %-6.3f %s :: %s\n", mark, i+1, result.Score, result.Path, result.Name)
+			}
 		}
 		rank := rankOf(results, q)
 		entry := bySet[q.Set]

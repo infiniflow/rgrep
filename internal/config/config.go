@@ -110,6 +110,19 @@ type Config struct {
 	// in seconds; 0 restores the engine's own choice.
 	PlaidCentroids int `json:"plaid_centroids"`
 
+	// VecIndex picks the multi-vector recall index: "plaid" (default) keeps the
+	// IVF + residual-code index, "smve" builds the sparse-projection index
+	// (`SMVETransform` + BMP) whose candidates are re-ranked with the exact
+	// MaxSim read back from the column. The two answer with different scores -
+	// PLAID scores the dequantized codes, SMVE the stored float32 vectors - so
+	// the setting is recorded here rather than inferred.
+	VecIndex string `json:"vec_index"`
+	// SMVEWidth / SMVETopK are the SMVE projection width (the sparse term space)
+	// and the tokens each side keeps. Zero leaves the engine's defaults
+	// (width 2048, topk 8).
+	SMVEWidth int `json:"smve_width"`
+	SMVETopK  int `json:"smve_topk"`
+
 	// BatchSize is the ONNX batch size used while indexing.
 	BatchSize int `json:"batch_size"`
 	// Sessions is how many ONNX sessions run forward passes at once while
@@ -217,6 +230,9 @@ func defaults() *Config {
 		PrefixQ:        50368,
 		PrefixD:        50369,
 		PlaidCentroids: 1024,
+		VecIndex:       "plaid",
+		SMVEWidth:      2048,
+		SMVETopK:       8,
 		BatchSize:      8,
 		MaxFileBytes:   1 << 20,
 		MaxEmbedChars:  1600,

@@ -117,6 +117,11 @@ type Config struct {
 	// tens of thousands of centroids and turns one index pass into hours of
 	// k-means. See `indexSpecs`.
 	PlaidCentroids int
+	// VecIndex is the multi-vector recall index: "plaid" (default) or "smve".
+	// SMVEWidth / SMVETopK are its projection width and per-side token budget.
+	VecIndex  string
+	SMVEWidth int
+	SMVETopK  int
 	// Timeout bounds both connect and each RPC.
 	Timeout time.Duration
 }
@@ -186,6 +191,10 @@ type Query struct {
 	// K is how many fused rows rgrep wants before its own re-ranking.
 	K     int
 	Alpha float64 // weight of the semantic branch for weighted_sum
+	// Options are the recall operator's own knobs (`plaid_n_ivf_probe`,
+	// `plaid_n_doc_to_score`, `plaid_n_full_scores`, ...), passed through to
+	// MATCH TENSOR as `k=v;k=v`. Nil keeps the engine's defaults.
+	Options map[string]string
 	// PathPrefix, Lang and Kind are pushed down as a filter.
 	PathPrefix string
 	Lang       string
@@ -436,6 +445,22 @@ func indexSpecs(cfg Config) []indexSpec {
 			params["ef_construction"] = strconv.Itoa(cfg.HNSWEfConstruction)
 		}
 		vec = indexSpec{"idx_" + ColVectors, "HNSW", sdk.NewIndexInfo(ColVectors, sdk.IndexTypeHnsw, params)}
+	} else if strings.EqualFold(cfg.VecIndex, "smve") {
+		// SMVE turns each token into a sparse top-k code over a random unit
+		// projection, sums the query's codes, averages the document's, and
+		// searches them with the BMP block-max index. Its candidates are
+		// re-ranked with the exact MaxSim read back from the column, so the
+		// score it reports is the float32 one - what makes it the reference to
+		// check a lossy index against. `width` is the sparse term space, `topk`
+		// how many terms each side keeps.
+		params := map[string]string{}
+		if cfg.SMVEWidth > 0 {
+			params["width"] = strconv.Itoa(cfg.SMVEWidth)
+		}
+		if cfg.SMVETopK > 0 {
+			params["topk"] = strconv.Itoa(cfg.SMVETopK)
+		}
+		vec = indexSpec{"idx_" + ColVectors, "SMVE", sdk.NewIndexInfo(ColVectors, sdk.IndexTypeSMVE, params)}
 	} else {
 		// `n_centroids` is the one PLAID parameter that decides how long an
 		// index pass takes: the engine's own choice is `16*sqrt(tokens)`
@@ -450,13 +475,19 @@ func indexSpecs(cfg Config) []indexSpec {
 		}
 		vec = indexSpec{"idx_" + ColVectors, "PLAID", sdk.NewIndexInfo(ColVectors, sdk.IndexTypePLAID, plaid)}
 	}
-	return []indexSpec{
-		vec,
+	specs := []indexSpec{
 		{"idx_" + ColFTS, "full-text", sdk.NewIndexInfo(ColFTS, sdk.IndexTypeFullText, nil)},
 		{"idx_" + ColPath, "path", secondary(ColPath, false)},
 		{"idx_" + ColLang, "lang", secondary(ColLang, true)},
 		{"idx_" + ColKind, "kind", secondary(ColKind, true)},
 	}
+	// `vec_index: "none"` leaves the column unindexed on purpose: MATCH TENSOR
+	// then scores every row from its float32 tokens, which is the exact MaxSim
+	// the approximation is measured against.
+	if !strings.EqualFold(cfg.VecIndex, "none") {
+		specs = append([]indexSpec{vec}, specs...)
+	}
+	return specs
 }
 
 // dense reports whether the table stores one pooled vector per row.
@@ -559,7 +590,7 @@ func (b *Backend) Search(q Query) ([]Hit, error) {
 		switch {
 		case hasMulti && hasText:
 			tbl = b.tbl.
-				MatchTensor(ColVectors, q.Vectors, "float", b.cfg.TensorTopN, nil).
+				MatchTensor(ColVectors, q.Vectors, "float", b.cfg.TensorTopN, q.Options).
 				MatchText(ColFTS, q.Text, b.cfg.TextTopN, nil).
 				Fusion(b.fusion(q), limit, b.fusionParams(q))
 		case hasDense && hasText:
@@ -568,7 +599,7 @@ func (b *Backend) Search(q Query) ([]Hit, error) {
 				MatchText(ColFTS, q.Text, b.cfg.TextTopN, nil).
 				Fusion(b.fusion(q), limit, b.fusionParams(q))
 		case hasMulti:
-			tbl = b.tbl.MatchTensor(ColVectors, q.Vectors, "float", b.cfg.TensorTopN, nil)
+			tbl = b.tbl.MatchTensor(ColVectors, q.Vectors, "float", b.cfg.TensorTopN, q.Options)
 		case hasDense:
 			tbl = b.tbl.MatchDense(ColVectors, q.Vector, "float", b.cfg.Metric, b.cfg.TensorTopN, nil)
 		default:
