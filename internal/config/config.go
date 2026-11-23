@@ -24,6 +24,41 @@ type Config struct {
 	// ORTLibDir contains libonnxruntime.*.dylib / .so / .dll.
 	ORTLibDir string `json:"ort_lib_dir"`
 
+	// Embedding selects the vector shape and therefore the engine index:
+	//
+	//   - "colbert" (default): one vector per token in a MULTIVECTOR column,
+	//     recalled by PLAID with MaxSim. ModelDir is the encoder.
+	//   - "dense": one pooled vector per unit in a VECTOR column, recalled by
+	//     HNSW under DenseMetric. DenseModelDir is the encoder.
+	//
+	// The two are not interchangeable: the column type is part of the schema,
+	// so switching means a new infinity_table (or a fresh data dir) and a full
+	// re-index.
+	Embedding string `json:"embedding"`
+	// DenseModelDir holds a sentence-transformers-style ONNX export plus its
+	// tokenizer.json (model.onnx or model_int8.onnx).
+	DenseModelDir string `json:"dense_model_dir"`
+	// DenseDim is the expected width. 0 reads it from the model's output shape;
+	// set it when the export leaves the dimension dynamic.
+	DenseDim int `json:"dense_dim"`
+	// DenseMaxLen caps tokens per unit (512 is the usual limit).
+	DenseMaxLen int `json:"dense_max_len"`
+	// DensePooling is "mean" (default) or "cls", used when the model exposes
+	// token states instead of a pooled sentence embedding.
+	DensePooling string `json:"dense_pooling"`
+	// DenseOutput names the graph output; empty auto-detects.
+	DenseOutput string `json:"dense_output"`
+	// DenseClsID / DenseSepID wrap the tokens (BERT family defaults 101/102).
+	// Set both to 0 when the tokenizer already adds them.
+	DenseClsID int32 `json:"dense_cls_id"`
+	DenseSepID int32 `json:"dense_sep_id"`
+	// DenseMetric is the HNSW distance: "cosine" (default), "l2" or "ip".
+	DenseMetric string `json:"dense_metric"`
+	// HNSWM / HNSWEfConstruction are the HNSW build parameters (0 = engine
+	// defaults, 16 / 200).
+	HNSWM              int `json:"hnsw_m"`
+	HNSWEfConstruction int `json:"hnsw_ef_construction"`
+
 	// InfinityMode is "embedded" (default) or "remote". Embedded runs the
 	// engine inside the daemon, on a unix socket in the data dir, so there is
 	// no server to install, no port to pick and nothing to supervise: the
@@ -87,12 +122,15 @@ type Config struct {
 	// Ignore lists extra path patterns to skip (substring match on the relative path).
 	Ignore []string `json:"ignore"`
 
-	// ModelPath/TokenizerPath are derived.
+	// ModelPath/TokenizerPath are derived (the ColBERT encoder).
 	ModelPath     string `json:"-"`
 	TokenizerPath string `json:"-"`
-	DBPath        string `json:"-"`
-	SocketPath    string `json:"-"`
-	LockPath      string `json:"-"`
+	// DenseModelPath/DenseTokenizerPath are the dense encoder's derived paths.
+	DenseModelPath     string `json:"-"`
+	DenseTokenizerPath string `json:"-"`
+	DBPath             string `json:"-"`
+	SocketPath         string `json:"-"`
+	LockPath           string `json:"-"`
 	// InfinityHost/InfinityPort are InfinityAddr split apart.
 	InfinityHost string `json:"-"`
 	InfinityPort int    `json:"-"`
@@ -136,16 +174,24 @@ func DefaultDataDir() string {
 
 func defaults() *Config {
 	cfg := &Config{
-		DataDir:       DefaultDataDir(),
-		InfinityMode:  "embedded",
-		InfinityAddr:  "127.0.0.1:23817",
-		InfinityDB:    "rgrep",
-		InfinityTable: "code_units",
-		TensorTopN:    200,
-		TextTopN:      200,
-		FusionTopN:    200,
-		Fusion:        "weighted_sum",
-		Dim:           48,
+		DataDir:            DefaultDataDir(),
+		InfinityMode:       "embedded",
+		InfinityAddr:       "127.0.0.1:23817",
+		InfinityDB:         "rgrep",
+		InfinityTable:      "code_units",
+		TensorTopN:         200,
+		TextTopN:           200,
+		FusionTopN:         200,
+		Fusion:             "weighted_sum",
+		Embedding:          "colbert",
+		DenseMaxLen:        512,
+		DensePooling:       "mean",
+		DenseClsID:         101,
+		DenseSepID:         102,
+		DenseMetric:        "cosine",
+		HNSWM:              16,
+		HNSWEfConstruction: 200,
+		Dim:                48,
 		// DocLen is the per-unit token cap of the late-interaction encoding: a
 		// unit costs `min(tokens, DocLen-2) * Dim * 4` bytes **twice** - once in
 		// the row's MULTIVECTOR column, once in the PLAID chunk - so its price is
@@ -200,6 +246,12 @@ func Load(dataDirOverride string) (*Config, error) {
 	if v := os.Getenv("RGREP_MODEL_DIR"); v != "" {
 		cfg.ModelDir = v
 	}
+	if v := os.Getenv("RGREP_EMBEDDING"); v != "" {
+		cfg.Embedding = v
+	}
+	if v := os.Getenv("RGREP_DENSE_MODEL_DIR"); v != "" {
+		cfg.DenseModelDir = v
+	}
 	if v := os.Getenv("RGREP_INFINITY_MODE"); v != "" {
 		cfg.InfinityMode = v
 	}
@@ -215,6 +267,12 @@ func Load(dataDirOverride string) (*Config, error) {
 	cfg.InfinitySocket = socketPathNamed(cfg.DataDir, "infinity.sock", "rgrep-infinity-%d.sock")
 	if cfg.ModelDir == "" {
 		cfg.ModelDir = filepath.Join(cfg.DataDir, "models", "LateOn-Code-edge")
+	}
+	if cfg.Embedding == "" {
+		cfg.Embedding = "colbert"
+	}
+	if cfg.DenseModelDir == "" {
+		cfg.DenseModelDir = filepath.Join(cfg.DataDir, "models", "dense")
 	}
 	if cfg.ORTLibDir == "" {
 		if exe, err := os.Executable(); err == nil {
@@ -236,10 +294,25 @@ func Load(dataDirOverride string) (*Config, error) {
 		}
 	}
 	cfg.TokenizerPath = filepath.Join(cfg.ModelDir, "tokenizer.json")
+	// int8 first here too: a quantised dense export is ~4x smaller and code
+	// retrieval loses little.
+	for _, name := range []string{"model_int8.onnx", "model.onnx"} {
+		p := filepath.Join(cfg.DenseModelDir, name)
+		if _, err := os.Stat(p); err == nil {
+			cfg.DenseModelPath = p
+			break
+		}
+	}
+	cfg.DenseTokenizerPath = filepath.Join(cfg.DenseModelDir, "tokenizer.json")
 	cfg.DBPath = filepath.Join(cfg.DataDir, "rgrep.db")
 	cfg.SocketPath = socketPath(cfg.DataDir)
 	cfg.LockPath = filepath.Join(cfg.DataDir, "daemon.lock")
 	return cfg, nil
+}
+
+// Dense reports whether the single-vector (HNSW) embedding is selected.
+func (c *Config) Dense() bool {
+	return strings.EqualFold(strings.TrimSpace(c.Embedding), "dense")
 }
 
 // splitAddr turns "host:port" into its parts, defaulting to the Infinity

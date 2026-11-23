@@ -9,7 +9,7 @@ package native
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../../native/rgrep_native/include
-#cgo LDFLAGS: ${SRCDIR}/../../native/rgrep_native/target/release/librgrep_native.a -lm
+#cgo LDFLAGS: -L${SRCDIR}/../../native/rgrep_native/target/release -lrgrep_native -lm
 
 #include <stdlib.h>
 

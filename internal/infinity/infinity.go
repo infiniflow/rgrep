@@ -62,6 +62,18 @@ const (
 	FusionRRF         = "rrf"
 )
 
+// Vector column shapes. The two are not interchangeable: a table is created
+// for one of them, and switching means a new table (the column type is part of
+// the schema, not a query parameter).
+const (
+	// VectorMulti stores one vector per token in a MULTIVECTOR column and is
+	// recalled by PLAID + MaxSim.
+	VectorMulti = "multivector"
+	// VectorDense stores one pooled vector per row in a VECTOR column and is
+	// recalled by HNSW under Metric.
+	VectorDense = "vector"
+)
+
 // Config is the connection and query shape of one Infinity instance.
 type Config struct {
 	Host     string
@@ -78,8 +90,19 @@ type Config struct {
 	Socket   string
 	LibDir   string
 
-	// Dim is the encoder width; the MULTIVECTOR column is (Dim).
+	// Dim is the encoder width: the MULTIVECTOR column is (Dim), the VECTOR
+	// column is (Dim) as well.
 	Dim int
+	// VectorType is VectorMulti (default) or VectorDense, and decides both the
+	// column type and the recall operator.
+	VectorType string
+	// Metric is the HNSW distance for VectorDense: "cosine" (default), "l2"
+	// or "ip". It is ignored by the PLAID index, which is always MaxSim.
+	Metric string
+	// HNSWM / HNSWEfConstruction are the HNSW build parameters. Zero leaves the
+	// engine's defaults (M=16, ef_construction=200).
+	HNSWM              int
+	HNSWEfConstruction int
 	// TensorTopN / TextTopN are how many rows each branch contributes, and
 	// FusionTopN how many fused rows the engine keeps before rgrep re-ranks.
 	TensorTopN int
@@ -114,6 +137,12 @@ func (c *Config) withDefaults() {
 	if c.Dim <= 0 {
 		c.Dim = 48
 	}
+	if c.VectorType == "" {
+		c.VectorType = VectorMulti
+	}
+	if c.Metric == "" {
+		c.Metric = "cosine"
+	}
 	if c.TensorTopN <= 0 {
 		c.TensorTopN = 200
 	}
@@ -146,8 +175,12 @@ func (c *Config) Addr() string { return fmt.Sprintf("%s:%d", c.Host, c.Port) }
 
 // Query is one hybrid retrieval request.
 type Query struct {
-	// Vectors is qn*Dim L2-normalised query token vectors.
+	// Vectors is the dense-vector path: qn*Dim L2-normalised query token
+	// vectors, one per token (VectorMulti).
 	Vectors [][]float32
+	// Vector is the single pooled query vector (VectorDense). Set exactly one
+	// of Vectors and Vector, matching the table's column type.
+	Vector []float32
 	// Text is the full-text side; empty means keyword recall is skipped.
 	Text string
 	// K is how many fused rows rgrep wants before its own re-ranking.
@@ -329,7 +362,7 @@ func (b *Backend) ensureSchema() error {
 			{Name: ColText, DataType: "VARCHAR"},
 			{Name: ColFTS, DataType: "VARCHAR"},
 			{Name: ColCode, DataType: "VARCHAR"},
-			{Name: ColVectors, DataType: fmt.Sprintf("multivector,%d,float32", b.cfg.Dim)},
+			{Name: ColVectors, DataType: b.vectorColumnType()},
 		}
 		if tbl, err = db.CreateTable(b.cfg.Table, schema, sdk.ConflictTypeIgnore); err != nil {
 			return fmt.Errorf("create table %s: %w", b.cfg.Table, err)
@@ -337,7 +370,7 @@ func (b *Backend) ensureSchema() error {
 	}
 	b.tbl = tbl
 
-	for _, ix := range indexSpecs(b.cfg.PlaidCentroids) {
+	for _, ix := range indexSpecs(b.cfg) {
 		// Ask first. `CREATE INDEX ... IF NOT EXISTS` is supposed to be the
 		// one call that does that, but this engine's `IF NOT EXISTS` still
 		// rewrites the catalog record and rebuilds the index over every row
@@ -373,7 +406,7 @@ type indexSpec struct {
 //     distinct values, so they are `cardinality = 'low'`: one roaring bitmap per
 //     value, which the engine intersects while building the recall's candidate
 //     mask, instead of decoding those columns of every row.
-func indexSpecs(plaidCentroids int) []indexSpec {
+func indexSpecs(cfg Config) []indexSpec {
 	secondary := func(column string, low bool) *sdk.IndexInfo {
 		var params map[string]string
 		if low {
@@ -381,24 +414,63 @@ func indexSpecs(plaidCentroids int) []indexSpec {
 		}
 		return sdk.NewIndexInfo(column, sdk.IndexTypeSecondary, params)
 	}
-	// `n_centroids` is the one PLAID parameter that decides how long an index
-	// pass takes: the engine's own choice is `16*sqrt(tokens)` rounded down to a
-	// power of two, so a repo of 130 k units (~16 M token vectors) asks for 32 768
-	// centroids, and `kmeans_l2` over `min(tokens, 256*k)` samples costs
-	// `samples * k * dims` per iteration. That is hours, spent before a single
-	// query can be answered. A fixed budget keeps the build in seconds; 0 leaves
-	// the engine's heuristic in place.
-	var plaid map[string]string
-	if plaidCentroids > 0 {
-		plaid = map[string]string{"n_centroids": strconv.Itoa(plaidCentroids)}
+	var vec indexSpec
+	if cfg.dense() {
+		// HNSW keeps the graph and the vectors; the parameters that matter for
+		// a code index of tens of thousands of units are M (edges per node) and
+		// ef_construction (candidate list while inserting). The engine's
+		// defaults are 16/200; a smaller graph is cheaper to build and costs
+		// recall, so rgrep only overrides them when configured.
+		metric := cfg.Metric
+		if metric == "" {
+			metric = "cosine"
+		}
+		// The engine upper-cases an option name before checking it against the
+		// index type's whitelist (METRIC / M / EF_CONSTRUCTION), so the key is
+		// spelled the way a `CREATE INDEX ... WITH (...)` statement spells it.
+		params := map[string]string{"metric": metric}
+		if cfg.HNSWM > 0 {
+			params["m"] = strconv.Itoa(cfg.HNSWM)
+		}
+		if cfg.HNSWEfConstruction > 0 {
+			params["ef_construction"] = strconv.Itoa(cfg.HNSWEfConstruction)
+		}
+		vec = indexSpec{"idx_" + ColVectors, "HNSW", sdk.NewIndexInfo(ColVectors, sdk.IndexTypeHnsw, params)}
+	} else {
+		// `n_centroids` is the one PLAID parameter that decides how long an
+		// index pass takes: the engine's own choice is `16*sqrt(tokens)`
+		// rounded down to a power of two, so a repo of 130 k units (~16 M token
+		// vectors) asks for 32 768 centroids, and `kmeans_l2` over
+		// `min(tokens, 256*k)` samples costs `samples * k * dims` per iteration.
+		// That is hours, spent before a single query can be answered. A fixed
+		// budget keeps the build in seconds; 0 leaves the engine's heuristic.
+		var plaid map[string]string
+		if cfg.PlaidCentroids > 0 {
+			plaid = map[string]string{"n_centroids": strconv.Itoa(cfg.PlaidCentroids)}
+		}
+		vec = indexSpec{"idx_" + ColVectors, "PLAID", sdk.NewIndexInfo(ColVectors, sdk.IndexTypePLAID, plaid)}
 	}
 	return []indexSpec{
-		{"idx_" + ColVectors, "PLAID", sdk.NewIndexInfo(ColVectors, sdk.IndexTypePLAID, plaid)},
+		vec,
 		{"idx_" + ColFTS, "full-text", sdk.NewIndexInfo(ColFTS, sdk.IndexTypeFullText, nil)},
 		{"idx_" + ColPath, "path", secondary(ColPath, false)},
 		{"idx_" + ColLang, "lang", secondary(ColLang, true)},
 		{"idx_" + ColKind, "kind", secondary(ColKind, true)},
 	}
+}
+
+// dense reports whether the table stores one pooled vector per row.
+func (c *Config) dense() bool {
+	return c.VectorType == VectorDense
+}
+
+// vectorColumnType is the SDK's comma form of the vector column definition:
+// `vector,<dim>,float32` for dense, `multivector,<dim>,float32` for ColBERT.
+func (b *Backend) vectorColumnType() string {
+	if b.cfg.dense() {
+		return fmt.Sprintf("vector,%d,float32", b.cfg.Dim)
+	}
+	return fmt.Sprintf("multivector,%d,float32", b.cfg.Dim)
 }
 
 // ReplaceUnits makes the engine's rows for one file exactly `units`: it
@@ -432,7 +504,7 @@ func (b *Backend) ReplaceUnits(path string, units []store.Unit) error {
 				ColText:    u.Text,
 				ColFTS:     u.FTS,
 				ColCode:    u.Code,
-				ColVectors: reshape(u.Vec, b.cfg.Dim),
+				ColVectors: b.vectorValue(u.Vec),
 			})
 		}
 		if _, err := b.tbl.Insert(rows); err != nil {
@@ -457,12 +529,14 @@ func (b *Backend) deletePath(path string) error {
 	return nil
 }
 
-// Search runs the hybrid query: PLAID recall, BM25 recall, and the fusion of
-// the two, all inside Infinity.
+// Search runs the hybrid query: vector recall (PLAID + MaxSim or HNSW + the
+// configured metric), BM25 recall, and the fusion of the two, all inside
+// Infinity.
 func (b *Backend) Search(q Query) ([]Hit, error) {
 	hasText := strings.TrimSpace(q.Text) != ""
-	hasVec := len(q.Vectors) > 0
-	if !hasText && !hasVec {
+	hasDense := len(q.Vector) > 0
+	hasMulti := len(q.Vectors) > 0
+	if !hasText && !hasDense && !hasMulti {
 		return nil, nil
 	}
 	limit := q.K
@@ -478,15 +552,25 @@ func (b *Backend) Search(q Query) ([]Hit, error) {
 		err error
 	)
 	run := func() error {
+		// The recall operator follows the query's shape, which in turn follows
+		// the table's column type: MatchTensor over a MULTIVECTOR column and
+		// MatchDense over a VECTOR column are not interchangeable.
 		var tbl *sdk.Table
 		switch {
-		case hasVec && hasText:
+		case hasMulti && hasText:
 			tbl = b.tbl.
 				MatchTensor(ColVectors, q.Vectors, "float", b.cfg.TensorTopN, nil).
 				MatchText(ColFTS, q.Text, b.cfg.TextTopN, nil).
 				Fusion(b.fusion(q), limit, b.fusionParams(q))
-		case hasVec:
+		case hasDense && hasText:
+			tbl = b.tbl.
+				MatchDense(ColVectors, q.Vector, "float", b.cfg.Metric, b.cfg.TensorTopN, nil).
+				MatchText(ColFTS, q.Text, b.cfg.TextTopN, nil).
+				Fusion(b.fusion(q), limit, b.fusionParams(q))
+		case hasMulti:
 			tbl = b.tbl.MatchTensor(ColVectors, q.Vectors, "float", b.cfg.TensorTopN, nil)
+		case hasDense:
+			tbl = b.tbl.MatchDense(ColVectors, q.Vector, "float", b.cfg.Metric, b.cfg.TensorTopN, nil)
 		default:
 			tbl = b.tbl.MatchText(ColFTS, q.Text, b.cfg.TextTopN, nil)
 		}
@@ -630,6 +714,19 @@ func hits(res interface{}) ([]Hit, error) {
 		})
 	}
 	return out, nil
+}
+
+// vectorValue is the column value the SDK encodes for an insert: a plain
+// float buffer for a VECTOR column, one `dim`-sized row per token for a
+// MULTIVECTOR column.
+func (b *Backend) vectorValue(vec []float32) interface{} {
+	if b.cfg.dense() {
+		if len(vec) > b.cfg.Dim {
+			return vec[:b.cfg.Dim]
+		}
+		return vec
+	}
+	return reshape(vec, b.cfg.Dim)
 }
 
 // reshape turns the flat token buffer into the MULTIVECTOR literal the SDK

@@ -105,6 +105,38 @@ PLAID training then happens on insert. This was verified explicitly, because
 "create index on an empty table" is the kind of thing that works in one engine
 and not another.
 
+### Dense vectors: the same table with an HNSW column
+
+`"embedding": "dense"` picks a single-vector encoder, and the only thing that
+changes in the schema is the vector column and its index:
+
+```sql
+vec    VECTOR(FLOAT, 768)                        -- SDK: "vector,768,float32"
+CREATE INDEX idx_vec ON code_units (vec) USING HNSW
+    WITH (metric = 'cosine', m = 16, ef_construction = 200);
+```
+
+Insert values are `[]float32` (one row per unit), not `[][]float32`.
+
+Three details cost time to find and are worth recording:
+
+- **Option names are validated upper-case.** The engine upper-cases every
+  `WITH (...)` key before matching the index type's whitelist, so the statement
+  must spell `metric` / `m` / `ef_construction`; `metric_type` is rejected with
+  `unsupported HNSW option 'METRIC_TYPE'` even though the catalog stores it as
+  `metric_type`.
+- **`VECTOR` and `MULTIVECTOR` are different column types**, so a table built in
+  one mode cannot be queried in the other. `rgrep` records `embedding_mode` in
+  the catalog and refuses to start on a mismatch, instead of letting the first
+  insert or `MATCH DENSE` fail.
+- **The query operator follows the column**, not the config: `MatchDense` on a
+  `VECTOR` column, `MatchTensor` on a `MULTIVECTOR` one. The client chooses by
+  asking the encoder whether it is multi-vector, so the two cannot drift.
+
+Recall is `MATCH DENSE (vec, queryVector, 'float', metric, topn)`; BM25 and
+fusion are byte-for-byte the same statements as the multi-vector path, and so is
+everything after the engine.
+
 The secondary indexes exist for the filter and for the writes. The engine answers
 a filter from them while it builds the recall's candidate mask, so `--lang`
 narrows before any row is read; `path = ?` is a point probe, which is what keeps

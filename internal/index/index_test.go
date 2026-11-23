@@ -9,9 +9,9 @@ import (
 
 func TestSplitIdents(t *testing.T) {
 	cases := map[string][]string{
-		"getUserById":   {"getUserById", "get", "user", "by", "id"},
+		"getUserById":     {"getUserById", "get", "user", "by", "id"},
 		"parse_arguments": {"parse_arguments", "parse", "arguments"},
-		"HTTPResponse":  {"HTTPResponse", "http", "response"},
+		"HTTPResponse":    {"HTTPResponse", "http", "response"},
 	}
 	for in, want := range cases {
 		got := strings.Fields(SplitIdents(in))

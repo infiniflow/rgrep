@@ -454,10 +454,19 @@ func cmdConfig(cfg *config.Config, args []string) int {
 		fmt.Println(string(b))
 		return 0
 	}
-	fmt.Printf("data_dir       %s\nmodel_dir      %s\nmodel          %s\nort_lib_dir    %s\ncatalog        %s\nsocket         %s\ninfinity       %s (%s.%s, fusion %s)\nembed dim      %d (doc_len %d, query_len %d)\n",
+	fmt.Printf("data_dir       %s\nmodel_dir      %s\nmodel          %s\nort_lib_dir    %s\ncatalog        %s\nsocket         %s\ninfinity       %s (%s.%s, fusion %s)\n",
 		cfg.DataDir, cfg.ModelDir, cfg.ModelPath, cfg.ORTLibDir, cfg.DBPath, cfg.SocketPath,
-		cfg.InfinityAddr, cfg.InfinityDB, cfg.InfinityTable, cfg.Fusion,
-		cfg.Dim, cfg.DocLen, cfg.QueryLen)
+		cfg.InfinityAddr, cfg.InfinityDB, cfg.InfinityTable, cfg.Fusion)
+	switch {
+	case cfg.Dense():
+		fmt.Printf("embedding      dense (hnsw %s, M %d, ef_construction %d), dim %d\n",
+			cfg.DenseMetric, cfg.HNSWM, cfg.HNSWEfConstruction, cfg.DenseDim)
+		fmt.Printf("dense model    %s (pooling %s, max_len %d)\n",
+			cfg.DenseModelPath, cfg.DensePooling, cfg.DenseMaxLen)
+	default:
+		fmt.Printf("embedding      colbert (plaid), dim %d (doc_len %d, query_len %d)\n",
+			cfg.Dim, cfg.DocLen, cfg.QueryLen)
+	}
 	return 0
 }
 

@@ -1,11 +1,13 @@
 // Package search is the thin layer between an agent's query and Infinity.
 //
 // Recall, scoring and fusion all happen in the engine (see package infinity):
-// PLAID multi-vector MaxSim and BM25 full-text are combined there with
-// `FUSION('weighted_sum')` or `FUSION('rrf')`. What is left here is the part
-// that is about code rather than about vectors: penalising test files, boosting
-// a unit whose name is exactly what was typed, and keeping one file from
-// filling the result list.
+// the vector branch (PLAID multi-vector MaxSim or HNSW dense) and the BM25
+// full-text branch are combined there with `FUSION('weighted_sum')` or
+// `FUSION('rrf')`. Which vector operator is emitted depends only on the
+// encoder's shape (Embedder.Multi), not on a separate mode flag. What is left
+// here is the part that is about code rather than about vectors: penalising
+// test files, boosting a unit whose name is exactly what was typed, and
+// keeping one file from filling the result list.
 package search
 
 import (
@@ -83,15 +85,23 @@ func (s *Searcher) Search(query string, opt Options) ([]Result, error) {
 		return nil, err
 	}
 
-	hits, err := s.r.Search(infinity.Query{
-		Vectors:    chunk(qvec, dim),
+	q := infinity.Query{
 		Text:       FullText(query),
 		K:          opt.Candidates,
 		Alpha:      opt.Alpha,
 		PathPrefix: opt.PathPrefix,
 		Lang:       opt.Lang,
 		Kind:       opt.Kind,
-	})
+	}
+	// The encoder decides the query shape: per-token vectors go to the PLAID
+	// branch, one pooled vector goes to the HNSW branch.
+	if s.emb.Multi() {
+		q.Vectors = chunk(qvec, dim)
+	} else {
+		q.Vector = qvec
+	}
+
+	hits, err := s.r.Search(q)
 	if err != nil {
 		return nil, err
 	}

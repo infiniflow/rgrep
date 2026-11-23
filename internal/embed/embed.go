@@ -1,5 +1,15 @@
-// Package embed turns text into ColBERT-style multi-vectors: one vector per
-// token, which is what the PLAID / MaxSim family needs.
+// Package embed turns text into vectors for Infinity.
+//
+// Two shapes are supported and they decide the index, not just the encoder:
+//
+//   - multi: one vector per token, like ColBERT. Infinity stores the row in a
+//     MULTIVECTOR column behind a PLAID index and scores with MaxSim.
+//   - dense: one pooled vector per text. Infinity stores the row in a
+//     VECTOR column behind an HNSW index and scores with cosine / L2 / IP.
+//
+// Multi() is therefore the switch the rest of the program reads: the indexer
+// writes the same flat buffer either way, but the backend has to know how many
+// vectors one text produced and which recall operator to emit.
 package embed
 
 import (
@@ -7,13 +17,18 @@ import (
 	"math"
 )
 
-// Embedder produces per-token vectors for documents and queries.
+// Embedder produces vectors for documents and queries.
 type Embedder interface {
-	// Dim is the embedding width (48 for LateOn-Code-edge).
+	// Dim is the embedding width (48 for LateOn-Code-edge, 768/1024 for a
+	// dense code model).
 	Dim() int
-	// EncodeDocs returns, for each input text, a flat slice of n*Dim token vectors.
+	// Multi reports the shape of EncodeDocs/EncodeQuery: true for one vector
+	// per token (ColBERT), false for one pooled vector per text.
+	Multi() bool
+	// EncodeDocs returns, for each input text, either a flat slice of n*Dim
+	// token vectors (Multi) or a single Dim-sized vector.
 	EncodeDocs(texts []string) ([][]float32, error)
-	// EncodeQuery returns a flat slice of n*Dim token vectors for one query.
+	// EncodeQuery is EncodeDocs for one query.
 	EncodeQuery(text string) ([]float32, error)
 	// Name identifies the encoder for the index metadata.
 	Name() string
@@ -47,20 +62,33 @@ func normalizeRows(v []float32, dim int) {
 // HashEmbedder is a dependency-free fallback used when onnxruntime is not
 // installed. It is a hashed bag-of-token embedding: useful for smoke tests and
 // for exercising the whole pipeline, not for production relevance.
+//
+// Both shapes are produced by the same code: multi emits one vector per
+// identifier token, dense averages them into one vector and normalises it.
 type HashEmbedder struct {
-	dim  int
-	name string
+	dim   int
+	name  string
+	multi bool
 }
 
-// NewHash builds a fallback embedder.
+// NewHash builds a fallback embedder that produces per-token vectors.
 func NewHash(dim int) *HashEmbedder {
 	if dim <= 0 {
 		dim = 64
 	}
-	return &HashEmbedder{dim: dim, name: "hash"}
+	return &HashEmbedder{dim: dim, name: "hash", multi: true}
 }
 
-func (h *HashEmbedder) Dim() int    { return h.dim }
+// NewHashDense builds a fallback embedder that produces one vector per text.
+func NewHashDense(dim int) *HashEmbedder {
+	if dim <= 0 {
+		dim = 64
+	}
+	return &HashEmbedder{dim: dim, name: "hash-dense", multi: false}
+}
+
+func (h *HashEmbedder) Dim() int     { return h.dim }
+func (h *HashEmbedder) Multi() bool  { return h.multi }
 func (h *HashEmbedder) Name() string { return h.name }
 func (h *HashEmbedder) Close() error { return nil }
 
@@ -91,28 +119,39 @@ func (h *HashEmbedder) vector(token string) []float32 {
 	return v
 }
 
+// encode is one text in this embedder's shape.
+func (h *HashEmbedder) encode(text string) []float32 {
+	words := splitIdentifiers(text)
+	if !h.multi {
+		pooled := make([]float32, h.dim)
+		for _, w := range words {
+			v := h.vector(w)
+			for d := range pooled {
+				pooled[d] += v[d]
+			}
+		}
+		Normalize(pooled)
+		return pooled
+	}
+	flat := make([]float32, 0, len(words)*h.dim)
+	for _, w := range words {
+		flat = append(flat, h.vector(w)...)
+	}
+	return flat
+}
+
 // EncodeDocs implements Embedder.
 func (h *HashEmbedder) EncodeDocs(texts []string) ([][]float32, error) {
 	out := make([][]float32, len(texts))
 	for i, t := range texts {
-		words := splitIdentifiers(t)
-		flat := make([]float32, 0, len(words)*h.dim)
-		for _, w := range words {
-			flat = append(flat, h.vector(w)...)
-		}
-		out[i] = flat
+		out[i] = h.encode(t)
 	}
 	return out, nil
 }
 
 // EncodeQuery implements Embedder.
 func (h *HashEmbedder) EncodeQuery(text string) ([]float32, error) {
-	words := splitIdentifiers(text)
-	flat := make([]float32, 0, len(words)*h.dim)
-	for _, w := range words {
-		flat = append(flat, h.vector(w)...)
-	}
-	return flat, nil
+	return h.encode(text), nil
 }
 
 func splitIdentifiers(s string) []string {

@@ -9,13 +9,16 @@ import (
 )
 
 // stubEmbedder returns a fixed-width token vector per token, so a query of n
-// tokens produces n vectors.
+// tokens produces n vectors. Set dense to encode one pooled vector instead.
 type stubEmbedder struct {
 	dim    int
 	tokens int
+	dense  bool
 }
 
 func (e *stubEmbedder) Dim() int { return e.dim }
+
+func (e *stubEmbedder) Multi() bool { return !e.dense }
 
 func (e *stubEmbedder) EncodeDocs(texts []string) ([][]float32, error) {
 	out := make([][]float32, len(texts))
@@ -27,6 +30,11 @@ func (e *stubEmbedder) EncodeDocs(texts []string) ([][]float32, error) {
 }
 
 func (e *stubEmbedder) EncodeQuery(string) ([]float32, error) {
+	if e.dense {
+		v := make([]float32, e.dim)
+		v[0] = 1
+		return v, nil
+	}
 	flat := make([]float32, e.tokens*e.dim)
 	for i := 0; i < e.tokens; i++ {
 		flat[i*e.dim] = 1
@@ -62,6 +70,25 @@ func TestSearchPushesQueryIntoTheEngine(t *testing.T) {
 	}
 	if r.got.Alpha != 0.7 || r.got.Lang != "go" {
 		t.Fatalf("query = %+v", r.got)
+	}
+}
+
+// A dense encoder must ask for the HNSW branch: one pooled vector, not a
+// per-token list the engine would try to score as a multi-vector.
+func TestDenseQueryCarriesOneVector(t *testing.T) {
+	r := &stubRetriever{hits: []infinity.Hit{{Path: "a.go", StartLine: 1, EndLine: 2, Score: 1}}}
+	s := New(r, &stubEmbedder{dim: 4, dense: true})
+	if _, err := s.Search("parse arguments", Options{K: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.got.Vectors) != 0 {
+		t.Fatalf("dense query also sent %d token vectors", len(r.got.Vectors))
+	}
+	if len(r.got.Vector) != 4 {
+		t.Fatalf("dense query vector = %v, want 4 floats", r.got.Vector)
+	}
+	if r.got.Text == "" {
+		t.Fatal("dense query dropped the BM25 side")
 	}
 }
 

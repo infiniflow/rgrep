@@ -1,0 +1,6 @@
+[toolchain]
+# Same nightly the engine is built with: two Rust staticlibs linked into one
+# binary may carry std only once, and the copy that survives has to be the same
+# std.
+channel = "nightly-2026-10-29"
+profile = "minimal"

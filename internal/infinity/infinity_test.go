@@ -23,11 +23,21 @@ import (
 //	RGREP_INFINITY_ADDR=127.0.0.1:23817 go test ./internal/infinity
 func openTestBackend(t *testing.T) *Backend {
 	t.Helper()
+	return openTestBackendWith(t, Config{})
+}
+
+// openTestBackendWith starts (or dials) an engine with the given overrides.
+func openTestBackendWith(t *testing.T, overrides Config) *Backend {
+	t.Helper()
 	dbName := fmt.Sprintf("rgrep_test_%d", time.Now().UnixNano())
 	cfg := Config{
 		Database: dbName, Table: "code_units",
 		Dim: 4, BatchSize: 2, Timeout: 5 * time.Second,
 	}
+	cfg.VectorType = overrides.VectorType
+	cfg.Metric = overrides.Metric
+	cfg.HNSWM = overrides.HNSWM
+	cfg.HNSWEfConstruction = overrides.HNSWEfConstruction
 	if addr := os.Getenv("RGREP_INFINITY_ADDR"); addr != "" {
 		cfg.Host, cfg.Port = splitHostPort(addr)
 	} else {
@@ -188,7 +198,7 @@ func TestReshapeAndQuote(t *testing.T) {
 // one, and the two that hold a handful of values need the bitmap layout.
 func TestIndexSpecsAnswerTheFilter(t *testing.T) {
 	secondary := map[string]*sdk.IndexInfo{}
-	for _, ix := range indexSpecs(1024) {
+	for _, ix := range indexSpecs(Config{PlaidCentroids: 1024}) {
 		if ix.info.IndexType == sdk.IndexTypeSecondary {
 			secondary[ix.info.TargetName] = ix.info
 		}
@@ -227,6 +237,95 @@ func TestFusionParams(t *testing.T) {
 	}
 	if b.fusion(Query{}) != FusionRRF {
 		t.Fatal("fusion method not honoured")
+	}
+}
+
+// A dense index must be HNSW over a VECTOR column, and the metric and build
+// parameters have to reach the engine: none of them can be changed later
+// without rebuilding.
+func TestDenseIndexSpecs(t *testing.T) {
+	specs := indexSpecs(Config{VectorType: VectorDense, Metric: "cosine", HNSWM: 32, HNSWEfConstruction: 400})
+	var vec *sdk.IndexInfo
+	for _, ix := range specs {
+		if ix.info.TargetName == ColVectors {
+			vec = ix.info
+		}
+	}
+	if vec == nil || vec.IndexType != sdk.IndexTypeHnsw {
+		t.Fatalf("dense vector index = %+v, want HNSW on %s", vec, ColVectors)
+	}
+	for key, want := range map[string]string{
+		"metric": "cosine", "m": "32", "ef_construction": "400",
+	} {
+		if got := vec.Params[key]; got != want {
+			t.Fatalf("hnsw %s = %q, want %q", key, got, want)
+		}
+	}
+	// A dense table must not also get a PLAID index: the engine would reject
+	// the second vector index on the same column.
+	for _, ix := range specs {
+		if ix.info.IndexType == sdk.IndexTypePLAID {
+			t.Fatalf("dense schema also created %s", ix.name)
+		}
+	}
+	b := &Backend{cfg: Config{Dim: 768, VectorType: VectorDense}}
+	if got := b.vectorColumnType(); got != "vector,768,float32" {
+		t.Fatalf("dense column type = %q", got)
+	}
+	if got := b.vectorValue([]float32{1, 2}); len(got.([]float32)) != 2 {
+		t.Fatalf("dense insert value = %v", got)
+	}
+	b.cfg.VectorType = VectorMulti
+	if got := b.vectorColumnType(); got != "multivector,768,float32" {
+		t.Fatalf("multi column type = %q", got)
+	}
+}
+
+// The dense path end to end: a VECTOR column, an HNSW index and MATCH DENSE.
+func TestDenseSearch(t *testing.T) {
+	b := openTestBackendWith(t, Config{VectorType: VectorDense, Metric: "cosine"})
+	units := []store.Unit{
+		{Path: "pkg/quantize.go", Lang: "go", Kind: "function", Name: "quantizeEmbeddings",
+			StartLine: 10, EndLine: 20, Text: "quantize embeddings to int8",
+			FTS: "quantize embeddings int8 quantization", Code: "func quantizeEmbeddings() {}",
+			Dim: 4, Vec: []float32{1, 0, 0, 0}},
+		{Path: "pkg/parse.go", Lang: "go", Kind: "function", Name: "parseArguments",
+			StartLine: 1, EndLine: 8, Text: "parse command line arguments",
+			FTS: "parse arguments command line", Code: "func parseArguments() {}",
+			Dim: 4, Vec: []float32{0, 0, 1, 0}},
+	}
+	if err := b.ReplaceUnits("pkg/quantize.go", units[:1]); err != nil {
+		t.Fatalf("replace: %v", err)
+	}
+	if err := b.ReplaceUnits("pkg/parse.go", units[1:]); err != nil {
+		t.Fatalf("replace: %v", err)
+	}
+
+	hits, err := b.Search(Query{Vector: []float32{1, 0, 0, 0}, K: 5})
+	if err != nil {
+		t.Fatalf("dense search: %v", err)
+	}
+	if len(hits) == 0 || hits[0].Path != "pkg/quantize.go" {
+		t.Fatalf("dense hits = %+v", hits)
+	}
+	hits, err = b.Search(Query{
+		Vector: []float32{1, 0, 0, 0},
+		Text:   "parse arguments",
+		K:      5,
+		Alpha:  0.6,
+	})
+	if err != nil {
+		t.Fatalf("dense hybrid search: %v", err)
+	}
+	if len(hits) != 2 {
+		t.Fatalf("dense hybrid hits = %+v", hits)
+	}
+	hits, err = b.Search(Query{Vector: []float32{1, 0, 0, 0}, K: 5, PathPrefix: "pkg/parse"})
+	if err != nil {
+		t.Fatalf("dense filtered search: %v", err)
+	}
+	if len(hits) != 1 || hits[0].Path != "pkg/parse.go" {
+		t.Fatalf("dense prefix filter = %+v", hits)
 	}
 }
 

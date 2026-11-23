@@ -44,8 +44,9 @@ type Unit struct {
 	FTS string
 	// Code is the raw snippet returned to callers.
 	Code string
-	// Dim is the encoder width; Vec is nvec*Dim float32 token vectors, each
-	// L2-normalised.
+	// Dim is the encoder width. In multi-vector mode Vec is nvec*Dim
+	// L2-normalised token vectors; in dense mode it is one Dim-sized
+	// L2-normalised vector. The backend writes whichever the column expects.
 	Dim int
 	Vec []float32
 }

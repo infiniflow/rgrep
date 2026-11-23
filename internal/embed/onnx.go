@@ -153,6 +153,10 @@ func (o *ONNX) Sessions() int { return cap(o.pool) }
 // Dim implements Embedder.
 func (o *ONNX) Dim() int { return o.opt.Dim }
 
+// Multi implements Embedder: LateOn-Code-edge is a ColBERT encoder, so one
+// text yields one vector per token.
+func (o *ONNX) Multi() bool { return true }
+
 // Name implements Embedder.
 func (o *ONNX) Name() string { return "lateon-code-edge:" + filepath.Base(o.opt.ModelPath) }
 

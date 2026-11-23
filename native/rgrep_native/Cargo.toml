@@ -8,7 +8,11 @@ license = "Apache-2.0"
 
 [lib]
 name = "rgrep_native"
-crate-type = ["staticlib", "rlib"]
+# A dylib, not a staticlib: the binary already links the engine's Rust
+# staticlib (`libinfinity_embedded.a`), and two Rust staticlibs in one link each
+# carry the allocator shim (`__rust_alloc` and friends), which the linker
+# rejects as duplicate symbols. One Rust staticlib per binary.
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 tree-sitter = "0.25.10"

@@ -140,12 +140,17 @@ One row per code unit in the Infinity table `rgrep.code_units`:
 | `text` | the text that was embedded |
 | `fts` | identifier-split text (`getUserById` → `get user by id`) for BM25 |
 | `code` | the snippet returned to callers |
-| `vec` | `MULTIVECTOR(FLOAT,48)` of the ColBERT token vectors |
+| `vec` | `MULTIVECTOR(FLOAT,48)` of the ColBERT token vectors, or `VECTOR(FLOAT,D)` in dense mode |
 
-Indexes: `USING PLAID` on `vec`, full-text on `fts`. Both are created at startup,
-before the table has any rows. The rows themselves live in
-`$DATA_DIR/infinity` (`catalog/`, `data/`, `wal/`), written by the embedded
-engine and readable only through it.
+Indexes: `USING PLAID` on `vec` (multi-vector) or `USING HNSW` (dense),
+full-text on `fts`. All are created at startup, before the table has any rows.
+The rows themselves live in `$DATA_DIR/infinity` (`catalog/`, `data/`, `wal/`),
+written by the embedded engine and readable only through it.
+
+Which of the two shapes `vec` has is decided by `"embedding"`, and it is part of
+the schema: switching modes needs a fresh `infinity_table` (or data dir) and a
+full re-index. `rgrep` refuses to start when the catalog says the index was
+built for the other mode, instead of failing halfway through an insert.
 
 The SQLite catalog (`$DATA_DIR/rgrep.db`) holds only `files` (hash, mtime, size,
 lang, unit count per file) and `meta`. It never holds text or vectors.
@@ -171,6 +176,21 @@ then rgrep re-ranks the fused candidate list:
 `path`, `lang` and `kind` filters are pushed into the engine. `--no-tests` is
 applied in Go, because "is this a test" is rgrep's own heuristic.
 
+**Dense mode** replaces the first line with a single-vector branch:
+
+```
+MATCH DENSE (vec, <one pooled query vector>, 'float', '<metric>', topn=tensor_topn)  -- HNSW
+MATCH TEXT  (fts, "<identifier terms>", topn=text_topn)                               -- BM25
+FUSION      ('weighted_sum', 'weights=<alpha>,<1-alpha>;normalize=minmax')
+```
+
+Everything after the engine is unchanged, which is the point: the fusion, the
+filters and the re-rankers do not care how the candidates were recalled. The
+model is any sentence-transformers-style ONNX export (`input_ids` +
+`attention_mask` in, one pooled vector out); `"pooling"` picks mean or CLS when
+the graph emits token states, and a `sentence_embedding` output is used as is.
+Vectors are L2-normalised in both modes, so `cosine` and `ip` coincide.
+
 ## Measurements (M1 / CPU / int8 model)
 
 | case | number |
@@ -190,8 +210,19 @@ model every time.
 ```jsonc
 {
   "data_dir": "...",
+  "embedding": "colbert",                    // or "dense"
   "model_dir": "/path/to/LateOn-Code-edge",  // contains model_int8.onnx + tokenizer.json
   "ort_lib_dir": "bin/onnxruntime/lib",      // libonnxruntime.*
+
+  // Dense mode only. Any sentence-transformers ONNX export + tokenizer.json.
+  "dense_model_dir": "/path/to/dense-model",
+  "dense_dim": 0,                            // 0 = read from the model output
+  "dense_max_len": 512,
+  "dense_pooling": "mean",                   // or "cls"
+  "dense_output": "",                         // "" = auto (sentence_embedding / last_hidden_state)
+  "dense_cls_id": 101, "dense_sep_id": 102,  // set both to 0 if the tokenizer wraps
+  "dense_metric": "cosine",                  // cosine | l2 | ip
+  "hnsw_m": 16, "hnsw_ef_construction": 200,
 
   "infinity_mode": "embedded",               // or "remote"
   "infinity_lib_dir": "",                    // default: <exe dir>/lib
@@ -219,6 +250,8 @@ model every time.
 `RGREP_INFINITY_ADDR` switches to remote mode against that endpoint (useful for
 tests); `RGREP_INFINITY_MODE` overrides the mode. The embedded engine keeps its
 segments in `$DATA_DIR/infinity` and serves `$DATA_DIR/infinity.sock`.
+`RGREP_EMBEDDING=colbert|dense` and `RGREP_DENSE_MODEL_DIR` override the
+embedding mode and its model directory.
 
 `onnxruntime_go` is built against `ORT_API_VERSION 29`, so it **needs ORT
 1.29.x**; on a mismatch the process prints `The requested API version ... is not
