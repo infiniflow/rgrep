@@ -1,15 +1,21 @@
 //! C ABI for rgrep's native half.
 //!
-//! Two calls, both JSON over a `char*` that the caller releases with
-//! `rg_free`:
+//! Two JSON calls, released with `rg_free`:
 //!
 //!   rg_codesplit(lang, path, content, len, err) -> units of one file
 //!   rg_tokenize(tokenizer, text, len, err)      -> {"ids":[...]}
+//!
+//! and one handle API for static (Model2Vec) embeddings:
+//!
+//!   rg_m2v_load(dir, err) -> handle | null
+//!   rg_m2v_encode(handle, texts, lens, count, out, err) -> 0 | -1
+//!   rg_m2v_dim(handle), rg_m2v_info(handle), rg_m2v_free(handle)
 //!
 //! Errors are reported out-of-band: a null return with a message in `err`,
 //! which is also released with `rg_free`. Every allocation crosses the
 //! boundary as a C string, so Go's cgo layer needs no knowledge of Rust types.
 
+mod model2vec;
 mod split;
 mod tokenize;
 

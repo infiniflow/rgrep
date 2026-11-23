@@ -162,3 +162,20 @@ func containsField(s, want string) bool {
 }
 
 var _ embed.Embedder = (*stubEmbedder)(nil)
+
+// A prose query containing "not"/"and"/"or" must not reach the engine as a
+// boolean expression: it used to fail with "incomplete boolean expression" and
+// return nothing at all.
+func TestFullTextDropsOperatorWords(t *testing.T) {
+	got := FullText("this does not resolve and or not")
+	for _, banned := range []string{"and", "or", "not"} {
+		for _, field := range strings.Fields(got) {
+			if field == banned {
+				t.Fatalf("FullText kept the operator %q: %q", banned, got)
+			}
+		}
+	}
+	if got == "" {
+		t.Fatal("FullText dropped every term")
+	}
+}

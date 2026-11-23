@@ -218,7 +218,11 @@ func FullText(q string) string {
 	var parts []string
 	for _, t := range strings.Fields(terms) {
 		t = strings.ToLower(t)
-		if len(t) < 2 || seen[t] {
+		// The engine parses the text branch as an expression: a bare `and`,
+		// `or` or `not` from prose ("this does not resolve") turns the whole
+		// query into "incomplete boolean expression" and loses every hit, so
+		// operator words never reach it.
+		if len(t) < 2 || seen[t] || isOperator(t) {
 			continue
 		}
 		seen[t] = true
@@ -228,6 +232,16 @@ func FullText(q string) string {
 		}
 	}
 	return strings.Join(parts, " ")
+}
+
+// isOperator reports words the engine's full-text parser treats as operators.
+func isOperator(term string) bool {
+	switch term {
+	case "and", "or", "not":
+		return true
+	default:
+		return false
+	}
 }
 
 // chunk splits a flat token buffer into one slice per token vector.

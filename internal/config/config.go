@@ -29,15 +29,23 @@ type Config struct {
 	//   - "colbert" (default): one vector per token in a MULTIVECTOR column,
 	//     recalled by PLAID with MaxSim. ModelDir is the encoder.
 	//   - "dense": one pooled vector per unit in a VECTOR column, recalled by
-	//     HNSW under DenseMetric. DenseModelDir is the encoder.
+	//     HNSW under DenseMetric. DenseModelDir is the encoder (ONNX + ORT).
+	//   - "model2vec": the same VECTOR + HNSW shape, encoded by a static
+	//     Model2Vec table instead of a transformer. Model2VecDir is the model
+	//     directory (config.json + model.safetensors + tokenizer.json); no
+	//     onnxruntime is loaded at all.
 	//
-	// The two are not interchangeable: the column type is part of the schema,
-	// so switching means a new infinity_table (or a fresh data dir) and a full
+	// All three are schema-level: the column type is part of the table, so
+	// switching means a new infinity_table (or a fresh data dir) and a full
 	// re-index.
 	Embedding string `json:"embedding"`
 	// DenseModelDir holds a sentence-transformers-style ONNX export plus its
 	// tokenizer.json (model.onnx or model_int8.onnx).
 	DenseModelDir string `json:"dense_model_dir"`
+	// Model2VecDir is a Model2Vec model directory as written by
+	// `StaticModel.save_pretrained`: config.json, model.safetensors and
+	// tokenizer.json. The width comes from the table, not from DenseDim.
+	Model2VecDir string `json:"model2vec_dir"`
 	// DenseDim is the expected width. 0 reads it from the model's output shape;
 	// set it when the export leaves the dimension dynamic.
 	DenseDim int `json:"dense_dim"`
@@ -252,6 +260,9 @@ func Load(dataDirOverride string) (*Config, error) {
 	if v := os.Getenv("RGREP_DENSE_MODEL_DIR"); v != "" {
 		cfg.DenseModelDir = v
 	}
+	if v := os.Getenv("RGREP_MODEL2VEC_DIR"); v != "" {
+		cfg.Model2VecDir = v
+	}
 	if v := os.Getenv("RGREP_INFINITY_MODE"); v != "" {
 		cfg.InfinityMode = v
 	}
@@ -273,6 +284,16 @@ func Load(dataDirOverride string) (*Config, error) {
 	}
 	if cfg.DenseModelDir == "" {
 		cfg.DenseModelDir = filepath.Join(cfg.DataDir, "models", "dense")
+	}
+	if cfg.Model2VecDir == "" {
+		cfg.Model2VecDir = filepath.Join(cfg.DataDir, "models", "model2vec")
+	}
+	switch cfg.Mode() {
+	case "colbert", "dense", "model2vec":
+	default:
+		return nil, fmt.Errorf(
+			`unknown "embedding" %q; use "colbert" (PLAID), "dense" (ONNX + HNSW) or "model2vec" (Model2Vec + HNSW)`,
+			cfg.Embedding)
 	}
 	if cfg.ORTLibDir == "" {
 		if exe, err := os.Executable(); err == nil {
@@ -311,8 +332,21 @@ func Load(dataDirOverride string) (*Config, error) {
 }
 
 // Dense reports whether the single-vector (HNSW) embedding is selected.
+//
+// Both "dense" (ONNX transformer) and "model2vec" (static table) produce one
+// pooled vector per unit, so they share the VECTOR column and the HNSW index.
 func (c *Config) Dense() bool {
-	return strings.EqualFold(strings.TrimSpace(c.Embedding), "dense")
+	mode := c.Mode()
+	return mode == "dense" || mode == "model2vec"
+}
+
+// Mode is the normalised embedding mode recorded in the catalog.
+func (c *Config) Mode() string {
+	mode := strings.ToLower(strings.TrimSpace(c.Embedding))
+	if mode == "" {
+		return "colbert"
+	}
+	return mode
 }
 
 // splitAddr turns "host:port" into its parts, defaulting to the Infinity

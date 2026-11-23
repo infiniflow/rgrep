@@ -37,10 +37,7 @@ func Open(cfg *config.Config) (*App, error) {
 	// The vector column's type is fixed when the table is created, so an index
 	// built in one mode cannot be opened in the other: refuse with a message
 	// that names the way out instead of failing later inside an insert.
-	mode := "colbert"
-	if cfg.Dense() {
-		mode = "dense"
-	}
+	mode := cfg.Mode()
 	if prev := cat.GetMeta("embedding_mode"); prev != "" && prev != mode {
 		_ = cat.Close()
 		return nil, fmt.Errorf(
@@ -48,7 +45,11 @@ func Open(cfg *config.Config) (*App, error) {
 				"or point infinity_table (or data_dir) at a fresh location and re-index for %q",
 			cfg.DataDir, prev, prev, mode)
 	}
-	emb, note := buildEmbedder(cfg)
+	emb, note, err := buildEmbedder(cfg)
+	if err != nil {
+		_ = cat.Close()
+		return nil, err
+	}
 	if prev := cat.GetMeta("dim"); prev != "" && prev != strconv.Itoa(emb.Dim()) {
 		_ = emb.Close()
 		_ = cat.Close()
@@ -99,15 +100,19 @@ func Open(cfg *config.Config) (*App, error) {
 	return a, nil
 }
 
-func buildEmbedder(cfg *config.Config) (embed.Embedder, string) {
+func buildEmbedder(cfg *config.Config) (embed.Embedder, string, error) {
+	if cfg.Mode() == "model2vec" {
+		return buildModel2VecEmbedder(cfg)
+	}
 	if cfg.Dense() {
-		return buildDenseEmbedder(cfg)
+		d, note := buildDenseEmbedder(cfg)
+		return d, note, nil
 	}
 	if cfg.ModelPath == "" {
-		return embed.NewHash(64), "hash fallback: no onnx model found"
+		return embed.NewHash(64), "hash fallback: no onnx model found", nil
 	}
 	if _, err := os.Stat(cfg.TokenizerPath); err != nil {
-		return embed.NewHash(64), "hash fallback: tokenizer.json missing"
+		return embed.NewHash(64), "hash fallback: tokenizer.json missing", nil
 	}
 	o, err := embed.NewONNX(embed.ONNXOptions{
 		ModelPath:     cfg.ModelPath,
@@ -125,9 +130,9 @@ func buildEmbedder(cfg *config.Config) (embed.Embedder, string) {
 		Sessions:      cfg.Sessions,
 	})
 	if err != nil {
-		return embed.NewHash(64), "hash fallback: " + err.Error()
+		return embed.NewHash(64), "hash fallback: " + err.Error(), nil
 	}
-	return o, "onnx: " + o.Name()
+	return o, "onnx: " + o.Name(), nil
 }
 
 // buildDenseEmbedder opens the single-vector model. Without a usable export it
@@ -157,6 +162,27 @@ func buildDenseEmbedder(cfg *config.Config) (embed.Embedder, string) {
 		return embed.NewHashDense(64), "hash fallback: " + err.Error()
 	}
 	return d, "onnx dense: " + d.Name()
+}
+
+// buildModel2VecEmbedder opens the static model.
+//
+// There is no hash fallback here, unlike the ONNX paths: the user asked for a
+// specific model, and a 256-dimension hash table would build an index of noise
+// that silently retrieves nothing useful. Name the directory and fail.
+func buildModel2VecEmbedder(cfg *config.Config) (embed.Embedder, string, error) {
+	m, err := embed.NewModel2Vec(cfg.Model2VecDir)
+	if err != nil {
+		return nil, "", fmt.Errorf(
+			"embedding=model2vec needs a model directory (config.json, model.safetensors, "+
+				"tokenizer.json) at %q; set \"model2vec_dir\" or RGREP_MODEL2VEC_DIR: %w",
+			cfg.Model2VecDir, err)
+	}
+	info := m.Info()
+	note := fmt.Sprintf("model2vec %s %dx%d", info.Dtype, info.Rows, info.Dim)
+	if info.HasWeights || info.HasMapping {
+		note += " (weights/mapping applied)"
+	}
+	return m, note, nil
 }
 
 // Close releases resources.
