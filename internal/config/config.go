@@ -69,6 +69,9 @@ type Config struct {
 
 	// BatchSize is the ONNX batch size used while indexing.
 	BatchSize int `json:"batch_size"`
+	// Sessions is how many ONNX sessions run forward passes at once while
+	// indexing. 0 means one per CPU; 1 keeps the single-session behaviour.
+	Sessions int `json:"sessions"`
 	// MaxFileBytes skips huge files (generated code, vendored blobs).
 	MaxFileBytes int64 `json:"max_file_bytes"`
 	// MaxEmbedChars truncates the structured text before tokenization.

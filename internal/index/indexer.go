@@ -170,6 +170,29 @@ func (ix *Indexer) Run(opt Options) (*Stats, error) {
 	}
 	sort.Slice(cands, func(i, j int) bool { return cands[i].rel < cands[j].rel })
 
+	// Root guard. The catalog keys files by their **path relative to the root**,
+	// so a pass run in a different directory matches almost nothing and the
+	// deletion sweep below treats the entire previous index as removed - one
+	// `rgrep index .` in the wrong place wipes the index, silently (measured: a
+	// 5227-file tree replaced by 25 files from another repo). The files are gone
+	// from the catalog by then and only a re-index brings them back, so this
+	// refuses instead: name the root, or say `--force` to mean "replace it".
+	if len(known) > 0 && !opt.Force {
+		overlap := 0
+		for rel := range seen {
+			if _, ok := known[rel]; ok {
+				overlap++
+			}
+		}
+		if overlap*10 < len(known) {
+			return nil, fmt.Errorf(
+				"refusing to index %s: the index holds %d files from another root "+
+					"(%d of them are here); run `rgrep index <that root>` to update it, "+
+					"or `rgrep index . --force` to replace the index with this tree",
+				root, len(known), overlap)
+		}
+	}
+
 	// Deletions first: cheap, and keeps the index consistent if we get killed.
 	for rel := range known {
 		if !seen[rel] {
@@ -236,6 +259,68 @@ func (ix *Indexer) Run(opt Options) (*Stats, error) {
 		}
 	}
 
+	// Files are encoded a batch at a time. One file is a dozen units, which
+	// leaves the model almost nothing to run in parallel: measured 457 units/s
+	// encoding file by file against 970 units/s when twenty files are handed
+	// over together. The write side stays per file, so one payload the engine
+	// refuses still only loses its own file.
+	type pendingFile struct {
+		c     candFile
+		units []store.Unit
+	}
+	const encodeUnitsPerBatch = 256
+	var batch []pendingFile
+	batchUnits := 0
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		all := make([]store.Unit, 0, batchUnits)
+		for _, p := range batch {
+			all = append(all, p.units...)
+		}
+		if err := ix.embedUnits(all); err != nil {
+			return fmt.Errorf("embed %d files: %w", len(batch), err)
+		}
+		off := 0
+		for _, p := range batch {
+			n := len(p.units)
+			units := all[off : off+n]
+			off += n
+			// Documents first, catalog second: a crash in between re-indexes
+			// the file next time (ReplaceUnits deletes by path first, so it is
+			// idempotent), while the other order would forget the units.
+			//
+			// One file the engine refuses does not end the pass: the row is
+			// counted in `failed` (which the caller prints) and the file stays
+			// out of the catalog, so the next run retries it. Aborting instead
+			// made a single payload the engine dislikes - a locale file here -
+			// discard a run that had already written 58 k units over half an
+			// hour.
+			if err := ix.eng.ReplaceUnits(p.c.rel, units); err != nil {
+				if opt.OnError != nil {
+					opt.OnError(p.c.rel, err)
+				}
+				stats.Failed++
+				continue
+			}
+			if err := ix.cat.PutFile(p.c.rel, store.FileState{
+				Hash: p.c.hash, MtimeNs: p.c.mtimeNs, Size: p.c.size, Lang: p.c.lang, Units: n,
+			}); err != nil {
+				return fmt.Errorf("catalog %s: %w", p.c.rel, err)
+			}
+			stats.Units += n
+			if p.c.added {
+				stats.Added++
+			} else {
+				stats.Changed++
+			}
+		}
+		batch = batch[:0]
+		batchUnits = 0
+		return nil
+	}
+
 	for _, c := range work {
 		if !c.changed && !c.added {
 			continue
@@ -254,36 +339,16 @@ func (ix *Indexer) Run(opt Options) (*Stats, error) {
 			stats.Failed++
 			continue
 		}
-		if err := ix.embedUnits(units); err != nil {
-			return nil, fmt.Errorf("embed %s: %w", c.rel, err)
-		}
-		// Documents first, catalog second: a crash in between re-indexes the
-		// file next time (ReplaceUnits deletes by path first, so it is
-		// idempotent), while the other order would forget the units.
-		//
-		// One file the engine refuses does not end the pass: the row is counted
-		// in `failed` (which the caller prints) and the file stays out of the
-		// catalog, so the next run retries it. Aborting instead made a single
-		// payload the engine dislikes - a locale file here - discard a run that
-		// had already written 58 k units over half an hour.
-		if err := ix.eng.ReplaceUnits(c.rel, units); err != nil {
-			if opt.OnError != nil {
-				opt.OnError(c.rel, err)
+		batch = append(batch, pendingFile{c: c, units: units})
+		batchUnits += len(units)
+		if batchUnits >= encodeUnitsPerBatch {
+			if err := flush(); err != nil {
+				return nil, err
 			}
-			stats.Failed++
-			continue
 		}
-		if err := ix.cat.PutFile(c.rel, store.FileState{
-			Hash: c.hash, MtimeNs: c.mtimeNs, Size: c.size, Lang: c.lang, Units: len(units),
-		}); err != nil {
-			return nil, fmt.Errorf("catalog %s: %w", c.rel, err)
-		}
-		stats.Units += len(units)
-		if c.added {
-			stats.Added++
-		} else {
-			stats.Changed++
-		}
+	}
+	if err := flush(); err != nil {
+		return nil, err
 	}
 
 	stats.Duration = time.Since(start)

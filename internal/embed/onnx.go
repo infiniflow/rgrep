@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -27,13 +28,22 @@ type ONNXOptions struct {
 	PrefixQ       int32
 	PrefixD       int32
 	BatchSize     int
+	// Sessions is how many inference sessions encode at once. 0 means one per
+	// CPU. One session draws on every core itself; several run single-threaded
+	// and are fed in parallel, which is what turns a batch of one or two units
+	// into real work (a per-file encode leaves ONNX nothing to parallelise).
+	Sessions int
 }
 
 // ONNX runs the ColBERT model through onnxruntime.
+//
+// Sessions are held in a pool: a caller of EncodeDocs may run concurrently
+// (indexing encodes files from several goroutines), and each forward pass
+// borrows one session for its duration. The pool size is therefore both the
+// concurrency limit and the parallelism the model gets.
 type ONNX struct {
 	opt  ONNXOptions
-	sess *ort.DynamicAdvancedSession
-	mu   sync.Mutex
+	pool chan *ort.DynamicAdvancedSession
 }
 
 var (
@@ -99,13 +109,46 @@ func NewONNX(opt ONNXOptions) (*ONNX, error) {
 	}
 	defer so.Destroy()
 
-	sess, err := ort.NewDynamicAdvancedSession(opt.ModelPath,
-		[]string{"input_ids", "attention_mask"}, []string{"output"}, so)
-	if err != nil {
-		return nil, fmt.Errorf("create session: %w", err)
+	sessions := opt.Sessions
+	if sessions <= 0 {
+		// Eight measured best on ten cores (970 units/s batching across files,
+		// against 783 at six and 743 at ten): past that the pool spends more on
+		// hand-off than the single-row batches give back.
+		sessions = runtime.GOMAXPROCS(0)
+		if sessions > 8 {
+			sessions = 8
+		}
 	}
-	return &ONNX{opt: opt, sess: sess}, nil
+	if sessions < 1 {
+		sessions = 1
+	}
+	if sessions > 1 {
+		// One session per core would otherwise multiply the intra-op thread
+		// pool by the session count (oversubscription, not speedup). The
+		// parallelism is the pool below.
+		if err := so.SetIntraOpNumThreads(1); err != nil {
+			return nil, fmt.Errorf("session threads: %w", err)
+		}
+	}
+
+	pool := make(chan *ort.DynamicAdvancedSession, sessions)
+	for i := 0; i < sessions; i++ {
+		sess, err := ort.NewDynamicAdvancedSession(opt.ModelPath,
+			[]string{"input_ids", "attention_mask"}, []string{"output"}, so)
+		if err != nil {
+			close(pool)
+			for s := range pool {
+				_ = s.Destroy()
+			}
+			return nil, fmt.Errorf("create session %d/%d: %w", i+1, sessions, err)
+		}
+		pool <- sess
+	}
+	return &ONNX{opt: opt, pool: pool}, nil
 }
+
+// Sessions is how many forward passes may run at once (for diagnostics).
+func (o *ONNX) Sessions() int { return cap(o.pool) }
 
 // Dim implements Embedder.
 func (o *ONNX) Dim() int { return o.opt.Dim }
@@ -114,7 +157,15 @@ func (o *ONNX) Dim() int { return o.opt.Dim }
 func (o *ONNX) Name() string { return "lateon-code-edge:" + filepath.Base(o.opt.ModelPath) }
 
 // Close implements Embedder.
-func (o *ONNX) Close() error { return o.sess.Destroy() }
+func (o *ONNX) Close() error {
+	var first error
+	for i := 0; i < cap(o.pool); i++ {
+		if err := (<-o.pool).Destroy(); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
 
 // EncodeDocs implements Embedder.
 func (o *ONNX) EncodeDocs(texts []string) ([][]float32, error) {
@@ -164,19 +215,57 @@ func (o *ONNX) encode(texts []string, maxLen int, prefix int32) ([][]float32, er
 
 	out := make([][]float32, len(texts))
 	bs := o.opt.BatchSize
-	o.mu.Lock()
-	defer o.mu.Unlock()
 
+	// One job per (token length, batch). Every job holds rows of a single
+	// length, so the jobs are independent and a session can take any of them -
+	// this is the unit of work the pool below parallelises.
+	type job struct {
+		tLen int
+		rows []encRow
+	}
+	var jobs []job
 	for tLen, rows := range groups {
 		for start := 0; start < len(rows); start += bs {
 			end := start + bs
 			if end > len(rows) {
 				end = len(rows)
 			}
-			if err := o.runBatch(rows[start:end], tLen, out); err != nil {
-				return nil, err
-			}
+			jobs = append(jobs, job{tLen: tLen, rows: rows[start:end]})
 		}
+	}
+	sort.Slice(jobs, func(i, j int) bool { return jobs[i].tLen < jobs[j].tLen })
+
+	// A query is a single job: it gets one session and no goroutines. A file's
+	// units (or a whole index batch) spread over the pool.
+	if len(jobs) == 1 {
+		sess := <-o.pool
+		err := o.runBatch(sess, jobs[0].rows, jobs[0].tLen, out)
+		o.pool <- sess
+		if err != nil {
+			return nil, err
+		}
+		return out, nil
+	}
+
+	errs := make(chan error, len(jobs))
+	for _, j := range jobs {
+		j := j
+		go func() {
+			sess := <-o.pool
+			err := o.runBatch(sess, j.rows, j.tLen, out)
+			o.pool <- sess
+			errs <- err
+		}()
+	}
+	// Each job writes only its own `out` indices, so the passes need no lock.
+	var firstErr error
+	for range jobs {
+		if err := <-errs; err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr != nil {
+		return nil, firstErr
 	}
 	return out, nil
 }
@@ -190,7 +279,7 @@ type encRow struct {
 
 // runBatch encodes rows that all have exactly tLen tokens, so there is no
 // padding and the result does not depend on the other rows in the batch.
-func (o *ONNX) runBatch(rows []encRow, tLen int, out [][]float32) error {
+func (o *ONNX) runBatch(sess *ort.DynamicAdvancedSession, rows []encRow, tLen int, out [][]float32) error {
 	n := len(rows)
 	ids := make([]int64, n*tLen)
 	mask := make([]int64, n*tLen)
@@ -217,7 +306,7 @@ func (o *ONNX) runBatch(rows []encRow, tLen int, out [][]float32) error {
 	}
 	defer outT.Destroy()
 
-	if err := o.sess.Run([]ort.Value{inIDs, inMask}, []ort.Value{outT}); err != nil {
+	if err := sess.Run([]ort.Value{inIDs, inMask}, []ort.Value{outT}); err != nil {
 		return fmt.Errorf("session run: %w", err)
 	}
 	data := outT.GetData()

@@ -87,6 +87,7 @@ func buildEmbedder(cfg *config.Config) (embed.Embedder, string) {
 		PrefixQ:       cfg.PrefixQ,
 		PrefixD:       cfg.PrefixD,
 		BatchSize:     cfg.BatchSize,
+		Sessions:      cfg.Sessions,
 	})
 	if err != nil {
 		return embed.NewHash(64), "hash fallback: " + err.Error()
